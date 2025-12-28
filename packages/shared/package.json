@@ -1,0 +1,17 @@
+
+{
+  "name": "@universal-contributor/shared",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./db": "./src/db/index.ts",
+    "./orchestrator": "./src/orchestrator/index.ts",
+    "./browser": "./src/browser/index.ts",
+    "./workspace": "./src/workspace/index.ts"
+  },
+  "dependencies": {
+    "browser-use-sdk": "^2.0.12"
+  }
+}

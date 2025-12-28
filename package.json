@@ -1,0 +1,23 @@
+{
+  "name": "universal-contributor",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun --filter '*' dev"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "agents": "^0.3.0",
+    "elysia": "^1.4.19",
+    "zod": "^4.2.1"
+  }
+}

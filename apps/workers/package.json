@@ -1,0 +1,22 @@
+{
+  "name": "@universal-contributor/workers",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "de": "bun --hot src/server.ts",
+    "build": "bun build src/ui/main.tsx --outdir=dist"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.62.16",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "lucide-react": "^0.468.0",
+    "@universal-contributor/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "typescript": "^5.7.2",
+    "tailwindcss": "^4.0.0"
+  }
+}
