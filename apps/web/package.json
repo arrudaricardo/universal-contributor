@@ -46,7 +46,7 @@
     "@tanstack/react-start": "^1.132.0",
     "@tanstack/router-plugin": "^1.132.0",
     "@universal-contributor/db-api": "workspace:*",
-    "browser-use-sdk": "^2.0.12",
+
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",

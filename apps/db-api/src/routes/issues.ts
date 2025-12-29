@@ -1,7 +1,6 @@
 import { Elysia, t } from "elysia";
-import { z } from "zod";
 import { dbPlugin } from "../db-plugin";
-import { BrowserUseClient } from "browser-use-sdk";
+import Firecrawl from "firecrawl";
 import { chat } from "@tanstack/ai";
 import { openaiText } from "@tanstack/ai-openai";
 
@@ -235,81 +234,125 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
       );
 
       try {
-        const client = new BrowserUseClient({
-          apiKey: process.env.BROWSER_USE_API_KEY!,
+        const firecrawl = new Firecrawl({
+          apiKey: process.env.FIRECRAWL_API_KEY!,
         });
 
         // Define the schema for issue extraction
-        const IssueDataSchema = z.object({
-          title: z.string(),
-          body: z.string(),
-          labels: z.array(z.string()),
-          state: z.string(),
-          author: z.string(),
-          createdAt: z.string(),
-        });
+        const IssueDataSchema = {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "The issue title" },
+            body: { type: "string", description: "The full issue description/body text" },
+            labels: { type: "array", items: { type: "string" }, description: "Array of label names" },
+            state: { type: "string", description: "The issue state (open or closed)" },
+            author: { type: "string", description: "The GitHub username who created the issue" },
+            createdAt: { type: "string", description: "When the issue was created" },
+          },
+          required: ["title", "body", "labels", "state", "author", "createdAt"],
+        };
 
         // Define the schema for repository extraction with environment info
-        const RepoDataSchema = z.object({
-          description: z.string().nullable(),
-          stars: z.number(),
-          forks: z.number(),
-          language: z.string().nullable(),
-          defaultBranch: z.string(),
-          // Environment detection
-          hasPackageJson: z.boolean(),
-          hasRequirementsTxt: z.boolean(),
-          hasPyprojectToml: z.boolean(),
-          hasCargoToml: z.boolean(),
-          hasGoMod: z.boolean(),
-          hasPomXml: z.boolean(),
-          hasGradleBuild: z.boolean(),
-          hasMakefile: z.boolean(),
-          hasDockerfile: z.boolean(),
-          readmeSetupInstructions: z.string().nullable(),
+        const RepoDataSchema = {
+          type: "object",
+          properties: {
+            description: { type: ["string", "null"], description: "The repository description" },
+            stars: { type: "number", description: "Number of stars" },
+            forks: { type: "number", description: "Number of forks" },
+            language: { type: ["string", "null"], description: "Primary programming language" },
+            defaultBranch: { type: "string", description: "The default branch name" },
+            hasPackageJson: { type: "boolean", description: "true if package.json exists in the root" },
+            hasRequirementsTxt: { type: "boolean", description: "true if requirements.txt exists in the root" },
+            hasPyprojectToml: { type: "boolean", description: "true if pyproject.toml exists in the root" },
+            hasCargoToml: { type: "boolean", description: "true if Cargo.toml exists in the root" },
+            hasGoMod: { type: "boolean", description: "true if go.mod exists in the root" },
+            hasPomXml: { type: "boolean", description: "true if pom.xml exists in the root" },
+            hasGradleBuild: { type: "boolean", description: "true if build.gradle or build.gradle.kts exists in the root" },
+            hasMakefile: { type: "boolean", description: "true if Makefile exists in the root" },
+            hasDockerfile: { type: "boolean", description: "true if Dockerfile exists in the root" },
+            readmeSetupInstructions: { type: ["string", "null"], description: "Setup/installation instructions from README (max 500 chars)" },
+          },
+          required: ["description", "stars", "forks", "language", "defaultBranch", "hasPackageJson", "hasRequirementsTxt", "hasPyprojectToml", "hasCargoToml", "hasGoMod", "hasPomXml", "hasGradleBuild", "hasMakefile", "hasDockerfile", "readmeSetupInstructions"],
+        };
+
+        // Extract issue data using Firecrawl
+        const issueResponse = await firecrawl.scrape(issue.url, {
+          formats: [
+            {
+              type: "json",
+              schema: IssueDataSchema,
+              prompt: `Extract the following information from this GitHub issue page:
+                - title: The issue title
+                - body: The full issue description/body text
+                - labels: Array of label names (e.g., ["bug", "help wanted"])
+                - state: The issue state (open or closed)
+                - author: The GitHub username who created the issue
+                - createdAt: When the issue was created`,
+            },
+          ],
         });
 
-        // Extract issue data
-        const issueTask = await client.tasks.createTask({
-          task: `Go to ${issue.url} and extract the following information from the GitHub issue page:
-            - title: The issue title
-            - body: The full issue description/body text
-            - labels: Array of label names (e.g., ["bug", "help wanted"])
-            - state: The issue state (open or closed)
-            - author: The GitHub username who created the issue
-            - createdAt: When the issue was created`,
-          schema: IssueDataSchema,
-        });
-
-        const issueResult = await issueTask.complete();
+        const issueResult = {
+          parsed: issueResponse.json as {
+            title: string;
+            body: string;
+            labels: string[];
+            state: string;
+            author: string;
+            createdAt: string;
+          } | undefined,
+        };
 
         // Extract repository data with environment info
         const repoUrl = `https://github.com/${repo.full_name}`;
-        const repoTask = await client.tasks.createTask({
-          task: `Go to ${repoUrl} and extract the following information from the GitHub repository page:
-            - description: The repository description (can be null if none)
-            - stars: Number of stars (as a number)
-            - forks: Number of forks (as a number)
-            - language: Primary programming language (can be null)
-            - defaultBranch: The default branch name (e.g., "main" or "master")
-            
-            Look at the file tree in the repository root and determine:
-            - hasPackageJson: true if package.json exists in the root
-            - hasRequirementsTxt: true if requirements.txt exists in the root
-            - hasPyprojectToml: true if pyproject.toml exists in the root
-            - hasCargoToml: true if Cargo.toml exists in the root
-            - hasGoMod: true if go.mod exists in the root
-            - hasPomXml: true if pom.xml exists in the root
-            - hasGradleBuild: true if build.gradle or build.gradle.kts exists in the root
-            - hasMakefile: true if Makefile exists in the root
-            - hasDockerfile: true if Dockerfile exists in the root
-            
-            Also look at the README file and extract:
-            - readmeSetupInstructions: Any setup/installation instructions found in the README (summarize in 500 chars max, or null if none found)`,
-          schema: RepoDataSchema,
+        const repoResponse = await firecrawl.scrape(repoUrl, {
+          formats: [
+            {
+              type: "json",
+              schema: RepoDataSchema,
+              prompt: `Extract the following information from this GitHub repository page:
+                - description: The repository description (can be null if none)
+                - stars: Number of stars (as a number)
+                - forks: Number of forks (as a number)
+                - language: Primary programming language (can be null)
+                - defaultBranch: The default branch name (e.g., "main" or "master")
+                
+                Look at the file tree in the repository root and determine:
+                - hasPackageJson: true if package.json exists in the root
+                - hasRequirementsTxt: true if requirements.txt exists in the root
+                - hasPyprojectToml: true if pyproject.toml exists in the root
+                - hasCargoToml: true if Cargo.toml exists in the root
+                - hasGoMod: true if go.mod exists in the root
+                - hasPomXml: true if pom.xml exists in the root
+                - hasGradleBuild: true if build.gradle or build.gradle.kts exists in the root
+                - hasMakefile: true if Makefile exists in the root
+                - hasDockerfile: true if Dockerfile exists in the root
+                
+                Also look at the README file and extract:
+                - readmeSetupInstructions: Any setup/installation instructions found in the README (summarize in 500 chars max, or null if none found)`,
+            },
+          ],
         });
 
-        const repoResult = await repoTask.complete();
+        const repoResult = {
+          parsed: repoResponse.json as {
+            description: string | null;
+            stars: number;
+            forks: number;
+            language: string | null;
+            defaultBranch: string;
+            hasPackageJson: boolean;
+            hasRequirementsTxt: boolean;
+            hasPyprojectToml: boolean;
+            hasCargoToml: boolean;
+            hasGoMod: boolean;
+            hasPomXml: boolean;
+            hasGradleBuild: boolean;
+            hasMakefile: boolean;
+            hasDockerfile: boolean;
+            readmeSetupInstructions: string | null;
+          } | undefined,
+        };
 
         // Update issue with extracted data
         const labelsJson = JSON.stringify(issueResult.parsed?.labels);

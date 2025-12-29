@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { createFileRoute } from '@tanstack/react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { treaty } from '@elysiajs/eden'
-import { PlusIcon, ExternalLinkIcon, CircleAlertIcon, CheckIcon, CircleIcon, GitPullRequestIcon, Trash2Icon } from 'lucide-react'
+import { PlusIcon, ExternalLinkIcon, CircleAlertIcon, CheckIcon, CircleIcon, GitPullRequestIcon, Trash2Icon, RefreshCwIcon } from 'lucide-react'
 import type { App } from '@universal-contributor/db-api'
 
 import { Button } from '@/components/ui/button'
@@ -20,6 +20,7 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Empty, EmptyHeader, EmptyTitle, EmptyDescription, EmptyMedia } from '@/components/ui/empty'
 import { Spinner } from '@/components/ui/spinner'
+import { toast } from 'sonner'
 
 const api = treaty<App>('localhost:3002')
 
@@ -295,6 +296,30 @@ function IssuesPage() {
     if (issueToDelete) {
       deleteIssueMutation.mutate(issueToDelete.id)
     }
+  }
+
+  const handleRetryExtraction = (issueId: number) => {
+    setExtractingIds((prev) => new Set(prev).add(issueId))
+    toast.info('Retrying extraction...')
+    
+    extractIssueDataApi(issueId)
+      .then(() => {
+        toast.success('Extraction completed successfully')
+        queryClient.invalidateQueries({ queryKey: ['issues'] })
+      })
+      .catch((e) => {
+        toast.error('Extraction failed', {
+          description: e instanceof Error ? e.message : 'Unknown error',
+        })
+      })
+      .finally(() => {
+        setExtractingIds((prev) => {
+          const next = new Set(prev)
+          next.delete(issueId)
+          return next
+        })
+        queryClient.invalidateQueries({ queryKey: ['issues'] })
+      })
   }
 
   const submitIssue = () => {
@@ -700,6 +725,20 @@ function IssuesPage() {
                       )}
                     </div>
                     <div className="flex items-center gap-2">
+                      {issue.status === 'error' && (
+                        <Button
+                          variant="outline"
+                          onClick={() => handleRetryExtraction(issue.id)}
+                          disabled={extractingIds.has(issue.id)}
+                        >
+                          {extractingIds.has(issue.id) ? (
+                            <Spinner className="mr-2 size-4" />
+                          ) : (
+                            <RefreshCwIcon className="mr-2 size-4" />
+                          )}
+                          Retry
+                        </Button>
+                      )}
                       {shouldShowFixButton(issue) && (
                         <Button
                           onClick={() => handleFixWithAI(issue)}

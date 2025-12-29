@@ -12,6 +12,5 @@
     "./workspace": "./src/workspace/index.ts"
   },
   "dependencies": {
-    "browser-use-sdk": "^2.0.12"
   }
 }
