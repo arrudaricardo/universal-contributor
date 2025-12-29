@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { createFileRoute } from '@tanstack/react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { treaty } from '@elysiajs/eden'
-import { PlusIcon, ExternalLinkIcon, CircleAlertIcon, CheckIcon, CircleIcon, GitPullRequestIcon } from 'lucide-react'
+import { PlusIcon, ExternalLinkIcon, CircleAlertIcon, CheckIcon, CircleIcon, GitPullRequestIcon, Trash2Icon } from 'lucide-react'
 import type { App } from '@universal-contributor/db-api'
 
 import { Button } from '@/components/ui/button'
@@ -158,6 +158,11 @@ const getContributionsByIssueApi = async (issueId: number): Promise<Contribution
   return (data || []) as Contribution[]
 }
 
+const deleteIssueApi = async (issueId: number) => {
+  const { error } = await api.issues({ id: String(issueId) }).delete()
+  if (error) throw new Error(String(error))
+}
+
 export const Route = createFileRoute('/issues')({
   component: IssuesPage,
 })
@@ -177,6 +182,10 @@ function IssuesPage() {
   const [fixDialogOpen, setFixDialogOpen] = useState(false)
   const [fixError, setFixError] = useState<string | null>(null)
   const [contribution, setContribution] = useState<Contribution | null>(null)
+
+  // Delete Issue State
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
+  const [issueToDelete, setIssueToDelete] = useState<Issue | null>(null)
 
   // Fetch issues with auto-refresh for active states
   const { data: issues, isLoading } = useQuery<Issue[]>({
@@ -266,6 +275,27 @@ function IssuesPage() {
       setError(e.message)
     },
   })
+
+  // Delete Issue Mutation
+  const deleteIssueMutation = useMutation({
+    mutationFn: deleteIssueApi,
+    onSuccess: () => {
+      setDeleteDialogOpen(false)
+      setIssueToDelete(null)
+      queryClient.invalidateQueries({ queryKey: ['issues'] })
+    },
+  })
+
+  const handleDeleteClick = (issue: Issue) => {
+    setIssueToDelete(issue)
+    setDeleteDialogOpen(true)
+  }
+
+  const confirmDelete = () => {
+    if (issueToDelete) {
+      deleteIssueMutation.mutate(issueToDelete.id)
+    }
+  }
 
   const submitIssue = () => {
     if (!issueUrl.trim()) return
@@ -587,6 +617,31 @@ function IssuesPage() {
           </DialogContent>
         </Dialog>
 
+        {/* Delete Confirmation Dialog */}
+        <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Delete Issue</DialogTitle>
+              <DialogDescription>
+                Are you sure you want to delete issue #{issueToDelete?.github_issue_number}? This action cannot be undone.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setDeleteDialogOpen(false)}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={confirmDelete}
+                disabled={deleteIssueMutation.isPending}
+              >
+                {deleteIssueMutation.isPending && <Spinner className="mr-2" />}
+                {deleteIssueMutation.isPending ? 'Deleting...' : 'Delete'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         {/* Issues List */}
         {isLoading ? (
           <div className="flex items-center justify-center py-12">
@@ -665,6 +720,14 @@ function IssuesPage() {
                           )}
                         </Button>
                       )}
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => handleDeleteClick(issue)}
+                        className="text-muted-foreground hover:text-destructive"
+                      >
+                        <Trash2Icon className="size-4" />
+                      </Button>
                     </div>
                   </div>
                 </CardHeader>

@@ -3,8 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun src/index.ts",
-    "dev": "bun --watch src/index.ts"
+    "start": "bun src/index.ts"
   },
   "dependencies": {
     "@elysiajs/eden": "^1.2.0"
