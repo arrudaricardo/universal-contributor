@@ -2,6 +2,8 @@ import { Elysia, t } from "elysia";
 import { z } from "zod";
 import { dbPlugin } from "../db-plugin";
 import { BrowserUseClient } from "browser-use-sdk";
+import { chat } from "@tanstack/ai";
+import { openaiText } from "@tanstack/ai-openai";
 
 export interface Issue {
   id: number;
@@ -17,10 +19,28 @@ export interface Issue {
   ai_complexity_score: number | null;
   ai_solvability_score: number | null;
   ai_analysis: string | null;
+  ai_fix_prompt: string | null;
   status: string;
   claimed_by_agent_id: number | null;
   claimed_at: string | null;
   discovered_at: string;
+}
+
+export interface RepositoryEnvironment {
+  id: number;
+  repository_id: number;
+  primary_language: string | null;
+  runtime: string | null;
+  runtime_version: string | null;
+  package_manager: string | null;
+  setup_commands: string | null;
+  test_commands: string | null;
+  memory_mb: number;
+  cpu_cores: number;
+  disk_mb: number;
+  docker_image: string | null;
+  discovered_at: string;
+  last_updated_at: string | null;
 }
 
 export const issuesRoutes = new Elysia({ prefix: "/issues" })
@@ -145,6 +165,10 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
         updates.push("claimed_at = ?");
         values.push(body.claimed_at);
       }
+      if (body.ai_fix_prompt !== undefined) {
+        updates.push("ai_fix_prompt = ?");
+        values.push(body.ai_fix_prompt);
+      }
 
       if (updates.length === 0) {
         throw new Error("No fields to update");
@@ -172,6 +196,7 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
         ai_solvability_score: t.Optional(t.Number()),
         claimed_by_agent_id: t.Optional(t.Nullable(t.Number())),
         claimed_at: t.Optional(t.Nullable(t.String())),
+        ai_fix_prompt: t.Optional(t.Nullable(t.String())),
       }),
     }
   )
@@ -193,8 +218,8 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
       }
 
       // Get repository info
-      const repo = db.get<{ id: number; full_name: string }>(
-        `SELECT id, full_name FROM repositories WHERE id = ?`,
+      const repo = db.get<{ id: number; full_name: string; language: string | null }>(
+        `SELECT id, full_name, language FROM repositories WHERE id = ?`,
         issue.repository_id
       );
 
@@ -224,12 +249,24 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
           createdAt: z.string(),
         });
 
-        // Define the schema for repository extraction
+        // Define the schema for repository extraction with environment info
         const RepoDataSchema = z.object({
           description: z.string().nullable(),
           stars: z.number(),
           forks: z.number(),
           language: z.string().nullable(),
+          defaultBranch: z.string(),
+          // Environment detection
+          hasPackageJson: z.boolean(),
+          hasRequirementsTxt: z.boolean(),
+          hasPyprojectToml: z.boolean(),
+          hasCargoToml: z.boolean(),
+          hasGoMod: z.boolean(),
+          hasPomXml: z.boolean(),
+          hasGradleBuild: z.boolean(),
+          hasMakefile: z.boolean(),
+          hasDockerfile: z.boolean(),
+          readmeSetupInstructions: z.string().nullable(),
         });
 
         // Extract issue data
@@ -246,14 +283,29 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
 
         const issueResult = await issueTask.complete();
 
-        // Extract repository data
+        // Extract repository data with environment info
         const repoUrl = `https://github.com/${repo.full_name}`;
         const repoTask = await client.tasks.createTask({
           task: `Go to ${repoUrl} and extract the following information from the GitHub repository page:
             - description: The repository description (can be null if none)
             - stars: Number of stars (as a number)
             - forks: Number of forks (as a number)
-            - language: Primary programming language (can be null)`,
+            - language: Primary programming language (can be null)
+            - defaultBranch: The default branch name (e.g., "main" or "master")
+            
+            Look at the file tree in the repository root and determine:
+            - hasPackageJson: true if package.json exists in the root
+            - hasRequirementsTxt: true if requirements.txt exists in the root
+            - hasPyprojectToml: true if pyproject.toml exists in the root
+            - hasCargoToml: true if Cargo.toml exists in the root
+            - hasGoMod: true if go.mod exists in the root
+            - hasPomXml: true if pom.xml exists in the root
+            - hasGradleBuild: true if build.gradle or build.gradle.kts exists in the root
+            - hasMakefile: true if Makefile exists in the root
+            - hasDockerfile: true if Dockerfile exists in the root
+            
+            Also look at the README file and extract:
+            - readmeSetupInstructions: Any setup/installation instructions found in the README (summarize in 500 chars max, or null if none found)`,
           schema: RepoDataSchema,
         });
 
@@ -261,12 +313,18 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
 
         // Update issue with extracted data
         const labelsJson = JSON.stringify(issueResult.parsed?.labels);
+        const labelsArray = issueResult.parsed?.labels || [];
+        
         db.run(
-          `UPDATE issues SET title = ?, body = ?, labels = ?, status = ? WHERE id = ?`,
+          `UPDATE issues SET title = ?, body = ?, labels = ?, status = ?, 
+           has_good_first_issue = ?, has_help_wanted = ?, has_bug_label = ? WHERE id = ?`,
           issueResult.parsed?.title || "",
           issueResult.parsed?.body || "",
           labelsJson,
-          issueResult.parsed?.state || "",
+          issueResult.parsed?.state || "open",
+          labelsArray.some((l: string) => l.toLowerCase().includes("good first issue")) ? 1 : 0,
+          labelsArray.some((l: string) => l.toLowerCase().includes("help wanted")) ? 1 : 0,
+          labelsArray.some((l: string) => l.toLowerCase().includes("bug")) ? 1 : 0,
           issueId
         );
 
@@ -278,6 +336,128 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
           repoResult.parsed?.forks || 0,
           repoResult.parsed?.language || "",
           repo.id
+        );
+
+        // Update or insert repository environment
+        const repoEnvData = repoResult.parsed;
+        if (repoEnvData) {
+          // Determine runtime and package manager based on detected files
+          let runtime: string | null = null;
+          let packageManager: string | null = null;
+          let setupCommands: string | null = null;
+          let testCommands: string | null = null;
+
+          if (repoEnvData.hasPackageJson) {
+            runtime = "node";
+            packageManager = "npm";
+            setupCommands = "npm install";
+            testCommands = "npm test";
+          } else if (repoEnvData.hasRequirementsTxt) {
+            runtime = "python";
+            packageManager = "pip";
+            setupCommands = "pip install -r requirements.txt";
+            testCommands = "pytest";
+          } else if (repoEnvData.hasPyprojectToml) {
+            runtime = "python";
+            packageManager = "poetry";
+            setupCommands = "poetry install";
+            testCommands = "poetry run pytest";
+          } else if (repoEnvData.hasCargoToml) {
+            runtime = "rust";
+            packageManager = "cargo";
+            setupCommands = "cargo build";
+            testCommands = "cargo test";
+          } else if (repoEnvData.hasGoMod) {
+            runtime = "go";
+            packageManager = "go";
+            setupCommands = "go mod download";
+            testCommands = "go test ./...";
+          } else if (repoEnvData.hasPomXml) {
+            runtime = "java";
+            packageManager = "maven";
+            setupCommands = "mvn install";
+            testCommands = "mvn test";
+          } else if (repoEnvData.hasGradleBuild) {
+            runtime = "java";
+            packageManager = "gradle";
+            setupCommands = "./gradlew build";
+            testCommands = "./gradlew test";
+          }
+
+          // Check if environment record exists
+          const existingEnv = db.get<RepositoryEnvironment>(
+            `SELECT * FROM repository_environments WHERE repository_id = ?`,
+            repo.id
+          );
+
+          if (existingEnv) {
+            db.run(
+              `UPDATE repository_environments SET 
+                primary_language = ?, runtime = ?, package_manager = ?, 
+                setup_commands = ?, test_commands = ?, last_updated_at = datetime('now')
+               WHERE repository_id = ?`,
+              repoEnvData.language,
+              runtime,
+              packageManager,
+              setupCommands,
+              testCommands,
+              repo.id
+            );
+          } else {
+            db.run(
+              `INSERT INTO repository_environments 
+                (repository_id, primary_language, runtime, package_manager, setup_commands, test_commands)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+              repo.id,
+              repoEnvData.language,
+              runtime,
+              packageManager,
+              setupCommands,
+              testCommands
+            );
+          }
+        }
+
+        // Generate AI fix prompt
+        const issueData = issueResult.parsed;
+        const aiFixPrompt = await chat({
+          adapter: openaiText("gpt-4o"),
+          messages: [{
+            role: "user",
+            content: `Generate a detailed prompt for an AI coding agent (OpenCode) to fix this GitHub issue.
+
+Repository: ${repo.full_name}
+URL: https://github.com/${repo.full_name}
+Primary Language: ${repoResult.parsed?.language || repo.language || "Unknown"}
+Default Branch: ${repoResult.parsed?.defaultBranch || "main"}
+
+Issue #${issue.github_issue_number}: ${issueData?.title || issue.title}
+
+Description:
+${issueData?.body || issue.body || "No description provided"}
+
+Labels: ${(issueData?.labels || []).join(", ") || "None"}
+
+The prompt should instruct the AI coding agent to:
+1. Understand and analyze the issue thoroughly
+2. Find relevant code files in the repository
+3. Make minimal, targeted changes to fix the issue
+4. Run tests if available to verify the fix works
+5. Create a git branch named 'fix/issue-${issue.github_issue_number}'
+6. Commit changes with a descriptive message referencing the issue
+7. Push the branch and create a pull request
+
+The prompt should be self-contained and provide enough context for the AI to work autonomously.
+Output ONLY the prompt text, no explanations or meta-commentary.`
+          }],
+          stream: false,
+        });
+
+        // Update issue with AI fix prompt
+        db.run(
+          `UPDATE issues SET ai_fix_prompt = ? WHERE id = ?`,
+          aiFixPrompt,
+          issueId
         );
 
         return { success: true };

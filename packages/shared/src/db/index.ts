@@ -59,6 +59,7 @@ export class Database {
         ai_complexity_score INTEGER,
         ai_solvability_score INTEGER,
         ai_analysis TEXT,
+        ai_fix_prompt TEXT,
         status TEXT NOT NULL DEFAULT 'open',
         claimed_by_agent_id INTEGER REFERENCES agents(id),
         claimed_at TEXT,

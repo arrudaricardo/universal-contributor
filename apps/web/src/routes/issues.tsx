@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { createFileRoute } from '@tanstack/react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { treaty } from '@elysiajs/eden'
-import { PlusIcon, ExternalLinkIcon, CircleAlertIcon } from 'lucide-react'
+import { PlusIcon, ExternalLinkIcon, CircleAlertIcon, CheckIcon, CircleIcon, GitPullRequestIcon } from 'lucide-react'
 import type { App } from '@universal-contributor/db-api'
 
 import { Button } from '@/components/ui/button'
@@ -23,6 +23,7 @@ import { Spinner } from '@/components/ui/spinner'
 
 const api = treaty<App>('localhost:3002')
 
+// Types
 interface Issue {
   id: number
   repository_id: number
@@ -33,8 +34,32 @@ interface Issue {
   labels: string | null
   status: string
   ai_analysis: string | null
+  ai_fix_prompt: string | null
 }
 
+interface Workspace {
+  id: number
+  issue_id: number | null
+  container_id: string | null
+  status: string
+  branch_name: string | null
+  error_message: string | null
+}
+
+interface Agent {
+  id: number
+  name: string
+  status: string
+}
+
+interface Contribution {
+  id: number
+  pr_url: string | null
+  pr_number: number | null
+  status: string
+}
+
+// API Functions
 const fetchIssues = async (): Promise<Issue[]> => {
   const { data, error } = await api.issues.get()
   if (error) throw new Error(String(error))
@@ -101,6 +126,38 @@ const extractIssueDataApi = async (issueId: number) => {
   return data
 }
 
+const getOrCreateAgentApi = async (): Promise<Agent> => {
+  const { data: agents } = await api.agents.get()
+  if (agents && agents.length > 0) {
+    return agents[0] as Agent
+  }
+  const { data: newAgent, error } = await api.agents.post({ name: 'web-agent' })
+  if (error || !newAgent) throw new Error('Failed to create agent')
+  return newAgent as Agent
+}
+
+const spawnWorkspaceApi = async (issueId: number, agentId: number): Promise<Workspace> => {
+  const { data, error } = await api.workspaces.spawn.post({
+    issue_id: issueId,
+    agent_id: agentId,
+    timeout_minutes: 60,
+  })
+  if (error) throw new Error(String(error))
+  return data as Workspace
+}
+
+const getWorkspaceApi = async (workspaceId: number): Promise<Workspace> => {
+  const { data, error } = await api.workspaces({ id: String(workspaceId) }).get()
+  if (error) throw new Error(String(error))
+  return data as Workspace
+}
+
+const getContributionsByIssueApi = async (issueId: number): Promise<Contribution[]> => {
+  const { data, error } = await api.contributions.get({ query: { issue_id: String(issueId) } })
+  if (error) throw new Error(String(error))
+  return (data || []) as Contribution[]
+}
+
 export const Route = createFileRoute('/issues')({
   component: IssuesPage,
 })
@@ -108,23 +165,78 @@ export const Route = createFileRoute('/issues')({
 function IssuesPage() {
   const queryClient = useQueryClient()
 
+  // Add Issue Dialog State
   const [issueUrl, setIssueUrl] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [extractingIds, setExtractingIds] = useState<Set<number>>(new Set())
   const [dialogOpen, setDialogOpen] = useState(false)
 
+  // Fix with AI State
+  const [fixingIssue, setFixingIssue] = useState<Issue | null>(null)
+  const [activeWorkspace, setActiveWorkspace] = useState<Workspace | null>(null)
+  const [fixDialogOpen, setFixDialogOpen] = useState(false)
+  const [fixError, setFixError] = useState<string | null>(null)
+  const [contribution, setContribution] = useState<Contribution | null>(null)
+
+  // Fetch issues with auto-refresh for active states
   const { data: issues, isLoading } = useQuery<Issue[]>({
     queryKey: ['issues'],
     queryFn: fetchIssues,
     refetchInterval: (query: { state: { data: Issue[] | undefined } }) => {
       const data = query.state.data
-      const hasExtracting = data?.some(
-        (issue) => issue.status === 'pending' || issue.status === 'extracting'
+      const hasActiveIssue = data?.some(
+        (issue) =>
+          issue.status === 'pending' ||
+          issue.status === 'extracting' ||
+          issue.status === 'fixing'
       )
-      return hasExtracting || extractingIds.size > 0 ? 3000 : false
+      return hasActiveIssue || extractingIds.size > 0 ? 3000 : false
     },
   })
 
+  // Poll workspace status while fix dialog is open
+  const { data: workspaceStatus } = useQuery({
+    queryKey: ['workspace', activeWorkspace?.id],
+    queryFn: () => (activeWorkspace ? getWorkspaceApi(activeWorkspace.id) : null),
+    enabled: !!activeWorkspace && fixDialogOpen,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      // Stop polling when complete or failed
+      if (
+        status === 'completed' ||
+        status === 'destroyed' ||
+        status === 'build_failed' ||
+        status === 'container_crashed' ||
+        status === 'timeout'
+      ) {
+        return false
+      }
+      return 2000 // Poll every 2 seconds
+    },
+  })
+
+  // Update activeWorkspace when polling returns new data
+  useEffect(() => {
+    if (workspaceStatus) {
+      setActiveWorkspace(workspaceStatus)
+
+      // When completed, fetch contribution for PR URL
+      if (workspaceStatus.status === 'completed' && fixingIssue) {
+        getContributionsByIssueApi(fixingIssue.id)
+          .then((contributions) => {
+            if (contributions.length > 0) {
+              setContribution(contributions[0])
+            }
+          })
+          .catch(console.error)
+
+        // Refresh issues list
+        queryClient.invalidateQueries({ queryKey: ['issues'] })
+      }
+    }
+  }, [workspaceStatus, fixingIssue, queryClient])
+
+  // Add Issue Mutation
   const addIssueMutation = useMutation({
     mutationFn: addIssueApi,
     onSuccess: async (result: { issueId: number; issueUrl: string; fullName: string }) => {
@@ -161,19 +273,63 @@ function IssuesPage() {
     addIssueMutation.mutate(issueUrl)
   }
 
-  const handleFixWithAI = (issueId: number) => {
-    // Placeholder - does nothing for now
-    console.log('Fix with AI clicked for issue:', issueId)
+  // Fix with AI Handler
+  const handleFixWithAI = async (issue: Issue) => {
+    setFixingIssue(issue)
+    setFixDialogOpen(true)
+    setActiveWorkspace(null)
+    setFixError(null)
+    setContribution(null)
+
+    try {
+      // Get or create agent
+      const agent = await getOrCreateAgentApi()
+
+      // Update issue status to 'fixing'
+      await api.issues({ id: String(issue.id) }).patch({ status: 'fixing' })
+      queryClient.invalidateQueries({ queryKey: ['issues'] })
+
+      // Spawn workspace
+      const workspace = await spawnWorkspaceApi(issue.id, agent.id)
+      setActiveWorkspace(workspace)
+    } catch (err) {
+      console.error('Failed to start fix:', err)
+      setFixError(err instanceof Error ? err.message : 'Failed to start fix')
+    }
   }
 
-  const getStatusBadgeVariant = (status: string): 'default' | 'secondary' | 'destructive' | 'outline' => {
+  // Helper Functions
+  const getStatusBadgeVariant = (
+    status: string
+  ): 'default' | 'secondary' | 'destructive' | 'outline' => {
     switch (status) {
       case 'pending':
       case 'extracting':
+      case 'fixing':
         return 'secondary'
       case 'open':
         return 'default'
+      case 'fixed':
+        return 'outline'
       case 'error':
+        return 'destructive'
+      default:
+        return 'outline'
+    }
+  }
+
+  const getWorkspaceStatusVariant = (
+    status?: string
+  ): 'default' | 'secondary' | 'destructive' | 'outline' => {
+    switch (status) {
+      case 'building':
+      case 'running':
+        return 'secondary'
+      case 'completed':
+        return 'default'
+      case 'build_failed':
+      case 'container_crashed':
+      case 'timeout':
         return 'destructive'
       default:
         return 'outline'
@@ -187,6 +343,71 @@ function IssuesPage() {
     } catch {
       return []
     }
+  }
+
+  const formatErrorMessage = (errorJson: string | null): string => {
+    if (!errorJson) return 'Unknown error'
+    try {
+      const error = JSON.parse(errorJson)
+      let message = error.message || 'Unknown error'
+      if (error.details?.logs) {
+        message += '\n\nLogs:\n' + error.details.logs
+      }
+      return message
+    } catch {
+      return errorJson
+    }
+  }
+
+  const getStepStatus = (step: 'building' | 'running' | 'completed'): 'done' | 'active' | 'pending' => {
+    const status = activeWorkspace?.status
+    const stepOrder = ['building', 'running', 'completed']
+    const currentIndex = stepOrder.indexOf(status || '')
+    const stepIndex = stepOrder.indexOf(step)
+
+    if (status === 'build_failed' || status === 'container_crashed' || status === 'timeout') {
+      // Show error state
+      if (step === 'building' && status === 'build_failed') return 'active'
+      if (step === 'running' && (status === 'container_crashed' || status === 'timeout')) return 'active'
+      if (stepIndex < currentIndex) return 'done'
+      return 'pending'
+    }
+
+    if (stepIndex < currentIndex) return 'done'
+    if (stepIndex === currentIndex) return 'active'
+    return 'pending'
+  }
+
+  const StepIcon = ({ step }: { step: 'building' | 'running' | 'completed' }) => {
+    const stepStatus = getStepStatus(step)
+    const status = activeWorkspace?.status
+    const isError =
+      (step === 'building' && status === 'build_failed') ||
+      (step === 'running' && (status === 'container_crashed' || status === 'timeout'))
+
+    if (isError) {
+      return <CircleAlertIcon className="size-4 text-destructive" />
+    }
+    if (stepStatus === 'done') {
+      return <CheckIcon className="size-4 text-green-500" />
+    }
+    if (stepStatus === 'active') {
+      return <Spinner className="size-4" />
+    }
+    return <CircleIcon className="size-4 text-muted-foreground" />
+  }
+
+  const isFixButtonDisabled = (issue: Issue): boolean => {
+    return (
+      issue.status === 'pending' ||
+      issue.status === 'extracting' ||
+      issue.status === 'fixing' ||
+      !issue.ai_fix_prompt
+    )
+  }
+
+  const shouldShowFixButton = (issue: Issue): boolean => {
+    return issue.status !== 'fixed'
   }
 
   return (
@@ -225,9 +446,7 @@ function IssuesPage() {
                   }}
                   placeholder="https://github.com/owner/repo/issues/123"
                 />
-                {error && (
-                  <p className="text-destructive text-sm">{error}</p>
-                )}
+                {error && <p className="text-destructive text-sm">{error}</p>}
               </div>
               <DialogFooter>
                 <Button variant="outline" onClick={() => setDialogOpen(false)}>
@@ -245,12 +464,135 @@ function IssuesPage() {
           </Dialog>
         </div>
 
+        {/* Fix with AI Progress Modal */}
+        <Dialog open={fixDialogOpen} onOpenChange={setFixDialogOpen}>
+          <DialogContent className="max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>Fixing Issue #{fixingIssue?.github_issue_number}</DialogTitle>
+              <DialogDescription className="truncate">
+                {fixingIssue?.title}
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="space-y-4 py-4">
+              {/* Status Badge */}
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium">Status:</span>
+                <Badge variant={getWorkspaceStatusVariant(activeWorkspace?.status)}>
+                  {(activeWorkspace?.status === 'building' ||
+                    activeWorkspace?.status === 'running') && <Spinner className="mr-1 size-3" />}
+                  {activeWorkspace?.status || 'initializing'}
+                </Badge>
+              </div>
+
+              {/* Progress Steps */}
+              <div className="space-y-3">
+                <div className="flex items-center gap-3">
+                  <StepIcon step="building" />
+                  <span
+                    className={
+                      getStepStatus('building') === 'done'
+                        ? 'text-muted-foreground line-through'
+                        : getStepStatus('building') === 'active'
+                          ? 'font-medium'
+                          : 'text-muted-foreground'
+                    }
+                  >
+                    Building Docker container...
+                  </span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <StepIcon step="running" />
+                  <span
+                    className={
+                      getStepStatus('running') === 'done'
+                        ? 'text-muted-foreground line-through'
+                        : getStepStatus('running') === 'active'
+                          ? 'font-medium'
+                          : 'text-muted-foreground'
+                    }
+                  >
+                    Running OpenCode to fix issue...
+                  </span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <StepIcon step="completed" />
+                  <span
+                    className={
+                      getStepStatus('completed') === 'done'
+                        ? 'text-muted-foreground line-through'
+                        : getStepStatus('completed') === 'active'
+                          ? 'font-medium'
+                          : 'text-muted-foreground'
+                    }
+                  >
+                    Creating pull request...
+                  </span>
+                </div>
+              </div>
+
+              {/* Initial Error (before workspace created) */}
+              {fixError && (
+                <div className="rounded-md bg-destructive/10 p-4">
+                  <p className="text-sm text-destructive font-medium">Failed to start</p>
+                  <p className="text-xs mt-2 text-destructive">{fixError}</p>
+                </div>
+              )}
+
+              {/* Workspace Error Display */}
+              {activeWorkspace?.error_message && (
+                <div className="rounded-md bg-destructive/10 p-4">
+                  <p className="text-sm text-destructive font-medium">Error</p>
+                  <pre className="text-xs mt-2 whitespace-pre-wrap overflow-auto max-h-40 text-destructive/80">
+                    {formatErrorMessage(activeWorkspace.error_message)}
+                  </pre>
+                </div>
+              )}
+
+              {/* Success Message */}
+              {activeWorkspace?.status === 'completed' && (
+                <div className="rounded-md bg-green-500/10 p-4 space-y-2">
+                  <p className="text-sm text-green-600 font-medium">Fix completed successfully!</p>
+                  {activeWorkspace.branch_name && (
+                    <p className="text-xs text-green-600/80">
+                      Branch: <code className="bg-green-500/10 px-1 rounded">{activeWorkspace.branch_name}</code>
+                    </p>
+                  )}
+                  {contribution?.pr_url && (
+                    <a
+                      href={contribution.pr_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-sm text-green-600 hover:underline"
+                    >
+                      <GitPullRequestIcon className="size-4" />
+                      View Pull Request #{contribution.pr_number}
+                      <ExternalLinkIcon className="size-3" />
+                    </a>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setFixDialogOpen(false)}>
+                {activeWorkspace?.status === 'completed' ||
+                activeWorkspace?.status === 'build_failed' ||
+                activeWorkspace?.status === 'container_crashed' ||
+                activeWorkspace?.status === 'timeout'
+                  ? 'Close'
+                  : 'Run in Background'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         {/* Issues List */}
         {isLoading ? (
           <div className="flex items-center justify-center py-12">
             <Spinner className="size-6" />
           </div>
-        ) : (!issues || issues.length === 0) ? (
+        ) : !issues || issues.length === 0 ? (
           <Empty className="border">
             <EmptyHeader>
               <EmptyMedia variant="icon">
@@ -274,10 +616,13 @@ function IssuesPage() {
                   <div className="flex items-start justify-between gap-4">
                     <div className="flex-1 min-w-0 space-y-1">
                       <div className="flex items-center gap-2">
-                        <Badge variant={getStatusBadgeVariant(issue.status)}>
-                          {(issue.status === 'pending' || issue.status === 'extracting') && (
-                            <Spinner className="mr-1 size-3" />
-                          )}
+                        <Badge
+                          variant={getStatusBadgeVariant(issue.status)}
+                          className={issue.status === 'fixed' ? 'bg-green-500/10 text-green-600 border-green-500/20' : ''}
+                        >
+                          {(issue.status === 'pending' ||
+                            issue.status === 'extracting' ||
+                            issue.status === 'fixing') && <Spinner className="mr-1 size-3" />}
                           {issue.status}
                         </Badge>
                         <span className="text-muted-foreground text-sm">
@@ -296,20 +641,35 @@ function IssuesPage() {
                         </a>
                       </CardTitle>
                       {issue.body && (
-                        <CardDescription className="line-clamp-2">
-                          {issue.body}
-                        </CardDescription>
+                        <CardDescription className="line-clamp-2">{issue.body}</CardDescription>
                       )}
                     </div>
-                    <Button
-                      onClick={() => handleFixWithAI(issue.id)}
-                      disabled={issue.status === 'pending' || issue.status === 'extracting'}
-                    >
-                      Fix with AI
-                    </Button>
+                    <div className="flex items-center gap-2">
+                      {shouldShowFixButton(issue) && (
+                        <Button
+                          onClick={() => handleFixWithAI(issue)}
+                          disabled={isFixButtonDisabled(issue)}
+                          title={
+                            !issue.ai_fix_prompt
+                              ? 'Waiting for issue extraction to complete'
+                              : undefined
+                          }
+                        >
+                          {issue.status === 'fixing' ? (
+                            <>
+                              <Spinner className="mr-2 size-4" />
+                              Fixing...
+                            </>
+                          ) : (
+                            'Fix with AI'
+                          )}
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 </CardHeader>
-                {(parseLabels(issue.labels).length > 0 || (issue.status === 'error' && issue.ai_analysis)) && (
+                {(parseLabels(issue.labels).length > 0 ||
+                  (issue.status === 'error' && issue.ai_analysis)) && (
                   <CardContent className="pt-0">
                     {parseLabels(issue.labels).length > 0 && (
                       <div className="flex flex-wrap gap-1">
@@ -321,9 +681,7 @@ function IssuesPage() {
                       </div>
                     )}
                     {issue.status === 'error' && issue.ai_analysis && (
-                      <p className="text-destructive text-sm mt-2">
-                        Error: {issue.ai_analysis}
-                      </p>
+                      <p className="text-destructive text-sm mt-2">Error: {issue.ai_analysis}</p>
                     )}
                   </CardContent>
                 )}
