@@ -227,6 +227,8 @@ await startOpencodeServer();
 
 // Setup graceful shutdown
 setupGracefulShutdown();
+console.log(process.env.OPENAI_API_KEY);
+
 
 const app = new Elysia()
   .use(cors())

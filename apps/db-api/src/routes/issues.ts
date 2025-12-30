@@ -93,7 +93,7 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
     "/",
     ({ db, body }) => {
       db.run(
-        `INSERT INTO issues (repository_id, github_issue_number, title, url, body, labels, status) 
+        `INSERT INTO issues (repository_id, github_issue_number, title, url, body, labels, status)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
         body.repository_id,
         body.github_issue_number,
@@ -316,7 +316,7 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
                 - forks: Number of forks (as a number)
                 - language: Primary programming language (can be null)
                 - defaultBranch: The default branch name (e.g., "main" or "master")
-                
+
                 Look at the file tree in the repository root and determine:
                 - hasPackageJson: true if package.json exists in the root
                 - hasRequirementsTxt: true if requirements.txt exists in the root
@@ -327,7 +327,7 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
                 - hasGradleBuild: true if build.gradle or build.gradle.kts exists in the root
                 - hasMakefile: true if Makefile exists in the root
                 - hasDockerfile: true if Dockerfile exists in the root
-                
+
                 Also look at the README file and extract:
                 - readmeSetupInstructions: Any setup/installation instructions found in the README (summarize in 500 chars max, or null if none found)`,
             },
@@ -357,9 +357,9 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
         // Update issue with extracted data
         const labelsJson = JSON.stringify(issueResult.parsed?.labels);
         const labelsArray = issueResult.parsed?.labels || [];
-        
+
         db.run(
-          `UPDATE issues SET title = ?, body = ?, labels = ?, status = ?, 
+          `UPDATE issues SET title = ?, body = ?, labels = ?, status = ?,
            has_good_first_issue = ?, has_help_wanted = ?, has_bug_label = ? WHERE id = ?`,
           issueResult.parsed?.title || "",
           issueResult.parsed?.body || "",
@@ -435,8 +435,8 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
 
           if (existingEnv) {
             db.run(
-              `UPDATE repository_environments SET 
-                primary_language = ?, runtime = ?, package_manager = ?, 
+              `UPDATE repository_environments SET
+                primary_language = ?, runtime = ?, package_manager = ?,
                 setup_commands = ?, test_commands = ?, last_updated_at = datetime('now')
                WHERE repository_id = ?`,
               repoEnvData.language,
@@ -448,7 +448,7 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
             );
           } else {
             db.run(
-              `INSERT INTO repository_environments 
+              `INSERT INTO repository_environments
                 (repository_id, primary_language, runtime, package_manager, setup_commands, test_commands)
                VALUES (?, ?, ?, ?, ?, ?)`,
               repo.id,
