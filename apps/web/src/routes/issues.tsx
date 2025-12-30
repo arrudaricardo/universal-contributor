@@ -164,6 +164,12 @@ const deleteIssueApi = async (issueId: number) => {
   if (error) throw new Error(String(error))
 }
 
+const cancelWorkspaceApi = async (workspaceId: number) => {
+  const { data, error } = await api.workspaces({ id: String(workspaceId) }).destroy.post()
+  if (error) throw new Error(String(error))
+  return data
+}
+
 export const Route = createFileRoute('/issues')({
   component: IssuesPage,
 })
@@ -287,6 +293,29 @@ function IssuesPage() {
     },
   })
 
+  // Cancel Workspace Mutation
+  const cancelWorkspaceMutation = useMutation({
+    mutationFn: async () => {
+      if (!activeWorkspace) throw new Error('No active workspace')
+      await cancelWorkspaceApi(activeWorkspace.id)
+      // Reset issue status back to 'open'
+      if (fixingIssue) {
+        await api.issues({ id: String(fixingIssue.id) }).patch({ status: 'open' })
+      }
+    },
+    onSuccess: () => {
+      toast.success('Fix cancelled', { description: 'The workspace has been destroyed' })
+      setFixDialogOpen(false)
+      setActiveWorkspace(null)
+      setFixingIssue(null)
+      queryClient.invalidateQueries({ queryKey: ['issues'] })
+      queryClient.invalidateQueries({ queryKey: ['workspace'] })
+    },
+    onError: (err: Error) => {
+      toast.error('Failed to cancel', { description: err.message })
+    },
+  })
+
   const handleDeleteClick = (issue: Issue) => {
     setIssueToDelete(issue)
     setDeleteDialogOpen(true)
@@ -386,6 +415,9 @@ function IssuesPage() {
       case 'container_crashed':
       case 'timeout':
         return 'destructive'
+      case 'destroyed':
+      case 'cancelled':
+        return 'outline'
       default:
         return 'outline'
     }
@@ -627,14 +659,35 @@ function IssuesPage() {
                   )}
                 </div>
               )}
+
+              {/* Cancelled Message */}
+              {activeWorkspace?.status === 'destroyed' && (
+                <div className="rounded-md bg-muted p-4">
+                  <p className="text-sm text-muted-foreground font-medium">Fix was cancelled</p>
+                  <p className="text-xs text-muted-foreground/80 mt-1">
+                    The workspace and container have been destroyed.
+                  </p>
+                </div>
+              )}
             </div>
 
             <DialogFooter>
+              {(activeWorkspace?.status === 'building' || activeWorkspace?.status === 'running') && (
+                <Button
+                  variant="destructive"
+                  onClick={() => cancelWorkspaceMutation.mutate()}
+                  disabled={cancelWorkspaceMutation.isPending}
+                >
+                  {cancelWorkspaceMutation.isPending && <Spinner className="mr-2 size-4" />}
+                  {cancelWorkspaceMutation.isPending ? 'Cancelling...' : 'Cancel'}
+                </Button>
+              )}
               <Button variant="outline" onClick={() => setFixDialogOpen(false)}>
                 {activeWorkspace?.status === 'completed' ||
                 activeWorkspace?.status === 'build_failed' ||
                 activeWorkspace?.status === 'container_crashed' ||
-                activeWorkspace?.status === 'timeout'
+                activeWorkspace?.status === 'timeout' ||
+                activeWorkspace?.status === 'destroyed'
                   ? 'Close'
                   : 'Run in Background'}
               </Button>
