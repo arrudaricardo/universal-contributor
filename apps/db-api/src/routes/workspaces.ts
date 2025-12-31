@@ -27,6 +27,285 @@ async function runDockerCommand(args: string[]): Promise<{ stdout: string; stder
   });
 }
 
+// Helper to sleep for a given number of milliseconds
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Helper to extract PR URL from a log line
+function extractPrUrl(line: string): { prUrl: string; prNumber: number } | null {
+  const match = line.match(/https:\/\/github\.com\/[^\/\s]+\/[^\/\s]+\/pull\/(\d+)/);
+  if (match && match[1]) {
+    return {
+      prUrl: match[0],
+      prNumber: parseInt(match[1]),
+    };
+  }
+  return null;
+}
+
+// Issue type for background execution
+interface IssueForExecution {
+  id: number;
+  github_issue_number: number;
+  title: string;
+  body: string | null;
+  ai_fix_prompt: string | null;
+}
+
+// Database interface for background execution
+interface DbInterface {
+  run(sql: string, ...params: (string | number | null)[]): void;
+  get<T>(sql: string, ...params: (string | number | null)[]): T | null;
+}
+
+// Background execution function - runs OpenCode in the container asynchronously
+async function executeOpenCodeInBackground(
+  db: DbInterface,
+  workspaceId: number,
+  containerId: string,
+  issue: IssueForExecution
+): Promise<void> {
+  // Build the prompt from the issue
+  const prompt =
+    issue.ai_fix_prompt ||
+    `Fix GitHub issue #${issue.github_issue_number}: ${issue.title}
+
+${issue.body || "No description provided"}
+
+Instructions:
+1. Analyze the issue and understand what needs to be fixed
+2. Find the relevant code in the repository
+3. Make the necessary changes to fix the issue
+4. Run tests to verify the fix works
+5. Create a git branch named 'fix/issue-${issue.github_issue_number}'
+6. Commit your changes with a descriptive message
+7. Push the branch and create a pull request`;
+
+  console.log(`[Workspace ${workspaceId}] Starting OpenCode execution...`);
+  
+  // Log the start
+  db.run(
+    `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
+    workspaceId,
+    `[System] Starting OpenCode to fix issue #${issue.github_issue_number}...`
+  );
+
+  // Spawn docker exec process
+  const proc = spawn("docker", [
+    "exec",
+    containerId,
+    "/home/ubuntu/.opencode/bin/opencode",
+    "run",
+    prompt,
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+
+  let stdoutBuffer = "";
+  let stderrBuffer = "";
+
+  // Process stdout data and insert each line into the database
+  proc.stdout?.on("data", (data) => {
+    stdoutBuffer += data.toString();
+    const lines = stdoutBuffer.split("\n");
+    // Keep the last incomplete line in the buffer
+    stdoutBuffer = lines.pop() || "";
+    
+    for (const line of lines) {
+      if (line.trim()) {
+        db.run(
+          `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
+          workspaceId,
+          line
+        );
+        console.log(`[Workspace ${workspaceId}] stdout: ${line.slice(0, 100)}...`);
+
+        // Check for PR URL and update workspace (always update with latest)
+        const prInfo = extractPrUrl(line);
+        if (prInfo) {
+          db.run(
+            `UPDATE workspaces SET pr_url = ? WHERE id = ?`,
+            prInfo.prUrl,
+            workspaceId
+          );
+          console.log(`[Workspace ${workspaceId}] Detected PR URL: ${prInfo.prUrl}`);
+        }
+      }
+    }
+  });
+
+  // Process stderr data and insert each line into the database
+  proc.stderr?.on("data", (data) => {
+    stderrBuffer += data.toString();
+    const lines = stderrBuffer.split("\n");
+    // Keep the last incomplete line in the buffer
+    stderrBuffer = lines.pop() || "";
+    
+    for (const line of lines) {
+      if (line.trim()) {
+        db.run(
+          `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stderr')`,
+          workspaceId,
+          line
+        );
+        console.log(`[Workspace ${workspaceId}] stderr: ${line.slice(0, 100)}...`);
+      }
+    }
+  });
+
+  // Handle process completion
+  proc.on("close", async (exitCode) => {
+    console.log(`[Workspace ${workspaceId}] OpenCode exited with code ${exitCode}`);
+    
+    // Flush any remaining buffered output
+    if (stdoutBuffer.trim()) {
+      db.run(
+        `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
+        workspaceId,
+        stdoutBuffer
+      );
+    }
+    if (stderrBuffer.trim()) {
+      db.run(
+        `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stderr')`,
+        workspaceId,
+        stderrBuffer
+      );
+    }
+
+    // Log completion
+    db.run(
+      `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
+      workspaceId,
+      `[System] OpenCode execution completed with exit code ${exitCode}`
+    );
+
+    // Update workspace status based on result
+    if (exitCode === 0) {
+      db.run(
+        `UPDATE workspaces SET status = 'completed' WHERE id = ?`,
+        workspaceId
+      );
+      console.log(`[Workspace ${workspaceId}] Marked as completed`);
+
+      // Create or update contribution record if PR was created
+      const completedWorkspace = db.get<Workspace>(
+        `SELECT * FROM workspaces WHERE id = ?`,
+        workspaceId
+      );
+
+      if (completedWorkspace?.pr_url && completedWorkspace.issue_id && completedWorkspace.agent_run_id) {
+        const prNumberMatch = completedWorkspace.pr_url.match(/\/pull\/(\d+)/);
+        const prNumber = prNumberMatch?.[1] ? parseInt(prNumberMatch[1]) : null;
+
+        // Check if contribution already exists for this issue
+        const existingContribution = db.get<{ id: number }>(
+          `SELECT id FROM contributions WHERE issue_id = ?`,
+          completedWorkspace.issue_id
+        );
+
+        if (existingContribution) {
+          // Update existing contribution with PR info
+          db.run(
+            `UPDATE contributions SET pr_url = ?, pr_number = ?, branch_name = ?, status = ?, updated_at = datetime('now') WHERE id = ?`,
+            completedWorkspace.pr_url,
+            prNumber,
+            completedWorkspace.branch_name,
+            "pr_open",
+            existingContribution.id
+          );
+          console.log(`[Workspace ${workspaceId}] Updated contribution ${existingContribution.id} with PR ${completedWorkspace.pr_url}`);
+        } else {
+          // Create new contribution
+          db.run(
+            `INSERT INTO contributions (agent_run_id, issue_id, pr_url, pr_number, branch_name, status) 
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            completedWorkspace.agent_run_id,
+            completedWorkspace.issue_id,
+            completedWorkspace.pr_url,
+            prNumber,
+            completedWorkspace.branch_name,
+            "pr_open"
+          );
+          console.log(`[Workspace ${workspaceId}] Created contribution with PR ${completedWorkspace.pr_url}`);
+        }
+      }
+    } else {
+      const errorData: WorkspaceError = {
+        type: "container_crashed",
+        message: `OpenCode exited with code ${exitCode}`,
+        details: {
+          logs: "See workspace logs for details",
+        },
+        timestamp: new Date().toISOString(),
+      };
+      db.run(
+        `UPDATE workspaces SET status = 'container_crashed', error_message = ? WHERE id = ?`,
+        JSON.stringify(errorData),
+        workspaceId
+      );
+      console.log(`[Workspace ${workspaceId}] Marked as container_crashed`);
+    }
+
+    // Wait 60 seconds before destroying container (for final log flush)
+    console.log(`[Workspace ${workspaceId}] Waiting 60 seconds before cleanup...`);
+    db.run(
+      `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
+      workspaceId,
+      `[System] Waiting 60 seconds before container cleanup...`
+    );
+    await sleep(60000);
+
+    // Destroy the container
+    console.log(`[Workspace ${workspaceId}] Destroying container ${containerId}...`);
+    try {
+      await runDockerCommand(["stop", containerId]);
+      await runDockerCommand(["rm", "-f", containerId]);
+      db.run(
+        `UPDATE workspaces SET destroyed_at = datetime('now') WHERE id = ?`,
+        workspaceId
+      );
+      db.run(
+        `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
+        workspaceId,
+        `[System] Container destroyed successfully`
+      );
+      console.log(`[Workspace ${workspaceId}] Container destroyed`);
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : "Unknown error";
+      console.error(`[Workspace ${workspaceId}] Failed to destroy container: ${errorMsg}`);
+      db.run(
+        `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stderr')`,
+        workspaceId,
+        `[System] Failed to destroy container: ${errorMsg}`
+      );
+    }
+  });
+
+  // Handle process errors
+  proc.on("error", (err) => {
+    console.error(`[Workspace ${workspaceId}] Process error: ${err.message}`);
+    db.run(
+      `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stderr')`,
+      workspaceId,
+      `[System] Process error: ${err.message}`
+    );
+    
+    const errorData: WorkspaceError = {
+      type: "container_crashed",
+      message: `Failed to execute OpenCode: ${err.message}`,
+      details: {
+        logs: err.message,
+      },
+      timestamp: new Date().toISOString(),
+    };
+    db.run(
+      `UPDATE workspaces SET status = 'container_crashed', error_message = ? WHERE id = ?`,
+      JSON.stringify(errorData),
+      workspaceId
+    );
+  });
+}
+
 // Error type for structured error messages
 export interface WorkspaceError {
   type: "build_failed" | "timeout" | "tests_failing" | "clone_failed" | "container_crashed";
@@ -57,6 +336,16 @@ export interface Workspace {
   created_at: string;
   destroyed_at: string | null;
   error_message: string | null;
+  dockerfile: string | null;
+  pr_url: string | null;
+}
+
+export interface WorkspaceLog {
+  id: number;
+  workspace_id: number;
+  line: string;
+  stream: "stdout" | "stderr";
+  created_at: string;
 }
 
 export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
@@ -64,6 +353,12 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
   .get(
     "/",
     ({ db, query }) => {
+      if (query.issue_id) {
+        return db.query<Workspace>(
+          `SELECT * FROM workspaces WHERE issue_id = ? ORDER BY created_at DESC`,
+          parseInt(query.issue_id)
+        );
+      }
       if (query.agent_id) {
         return db.query<Workspace>(
           `SELECT * FROM workspaces WHERE agent_id = ? ORDER BY created_at DESC`,
@@ -84,6 +379,7 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
       query: t.Object({
         agent_id: t.Optional(t.String()),
         status: t.Optional(t.String()),
+        issue_id: t.Optional(t.String()),
       }),
     }
   )
@@ -164,6 +460,10 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
         updates.push("error_message = ?");
         values.push(body.error_message);
       }
+      if (body.pr_url !== undefined) {
+        updates.push("pr_url = ?");
+        values.push(body.pr_url);
+      }
 
       if (updates.length === 0) {
         throw new Error("No fields to update");
@@ -188,6 +488,7 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
         expires_at: t.Optional(t.Nullable(t.String())),
         destroyed_at: t.Optional(t.Nullable(t.String())),
         error_message: t.Optional(t.Nullable(t.String())),
+        pr_url: t.Optional(t.Nullable(t.String())),
       }),
     }
   )
@@ -257,9 +558,10 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
       const branchName = `fix/issue-${issue.github_issue_number}`;
 
       db.run(
-        `INSERT INTO workspaces (agent_id, repository_id, issue_id, status, branch_name, base_branch, timeout_minutes, expires_at) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO workspaces (agent_id, agent_run_id, repository_id, issue_id, status, branch_name, base_branch, timeout_minutes, expires_at) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         body.agent_id,
+        body.agent_run_id,
         repo.id,
         issue.id,
         "building",
@@ -503,13 +805,26 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
 
         console.log(`Container ${containerId} started successfully`);
 
-        // Update workspace with container ID
+        // Update workspace with container ID and save dockerfile
         db.run(
-          `UPDATE workspaces SET container_id = ?, status = ? WHERE id = ?`,
+          `UPDATE workspaces SET container_id = ?, status = ?, dockerfile = ? WHERE id = ?`,
           containerId,
           "running",
+          dockerfile,
           workspace.id
         );
+
+        // Start OpenCode execution in background (non-blocking)
+        // This will update the workspace status and logs as it runs
+        executeOpenCodeInBackground(db, workspace.id, containerId, {
+          id: issue.id,
+          github_issue_number: issue.github_issue_number,
+          title: issue.title,
+          body: issue.body,
+          ai_fix_prompt: issue.ai_fix_prompt,
+        });
+
+        console.log(`[Workspace ${workspace.id}] OpenCode execution started in background`);
 
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : "Unknown container error";
@@ -527,7 +842,7 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
         throw new Error(`Container creation failed: ${errorMsg}`);
       }
 
-      // Return the updated workspace
+      // Return the updated workspace immediately (execution continues in background)
       return db.get<Workspace>(
         `SELECT * FROM workspaces WHERE id = ?`,
         workspace.id
@@ -537,6 +852,7 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
       body: t.Object({
         issue_id: t.Number(),
         agent_id: t.Number(),
+        agent_run_id: t.Number(),
         timeout_minutes: t.Optional(t.Number()),
       }),
     }
@@ -582,5 +898,130 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
         const errorMsg = err instanceof Error ? err.message : "Unknown error";
         throw new Error(`Failed to destroy container: ${errorMsg}`);
       }
+    }
+  )
+  // Get workspace logs with optional pagination
+  .get(
+    "/:id/logs",
+    ({ db, params, query }) => {
+      const workspaceId = parseInt(params.id);
+      
+      // Check if workspace exists
+      const workspace = db.get<Workspace>(
+        `SELECT id FROM workspaces WHERE id = ?`,
+        workspaceId
+      );
+      
+      if (!workspace) {
+        throw new Error("Workspace not found");
+      }
+      
+      // If after_id is provided, fetch only logs after that ID (for incremental updates)
+      if (query.after_id) {
+        const afterId = parseInt(query.after_id);
+        return db.query<WorkspaceLog>(
+          `SELECT * FROM workspace_logs WHERE workspace_id = ? AND id > ? ORDER BY id ASC`,
+          workspaceId,
+          afterId
+        );
+      }
+      
+      // Otherwise return all logs
+      return db.query<WorkspaceLog>(
+        `SELECT * FROM workspace_logs WHERE workspace_id = ? ORDER BY id ASC`,
+        workspaceId
+      );
+    },
+    {
+      query: t.Object({
+        after_id: t.Optional(t.String()),
+      }),
+    }
+  )
+  // Delete workspace logs (for cleanup)
+  .delete(
+    "/:id/logs",
+    ({ db, params }) => {
+      const workspaceId = parseInt(params.id);
+      db.run(
+        `DELETE FROM workspace_logs WHERE workspace_id = ?`,
+        workspaceId
+      );
+      return { success: true };
+    }
+  )
+  // Get PR information for a workspace
+  .get(
+    "/:id/pr",
+    ({ db, params }) => {
+      const workspaceId = parseInt(params.id);
+
+      const workspace = db.get<{
+        pr_url: string | null;
+        branch_name: string | null;
+        issue_id: number | null;
+      }>(
+        `SELECT pr_url, branch_name, issue_id FROM workspaces WHERE id = ?`,
+        workspaceId
+      );
+
+      if (!workspace) {
+        throw new Error("Workspace not found");
+      }
+
+      // If pr_url is stored on workspace, return it
+      if (workspace.pr_url) {
+        const prNumberMatch = workspace.pr_url.match(/\/pull\/(\d+)/);
+        return {
+          pr_url: workspace.pr_url,
+          pr_number: prNumberMatch?.[1] ? parseInt(prNumberMatch[1]) : null,
+          branch_name: workspace.branch_name,
+          source: "workspace" as const,
+        };
+      }
+
+      // Fallback: search logs for PR URL
+      const logWithPr = db.get<{ line: string }>(
+        `SELECT line FROM workspace_logs 
+         WHERE workspace_id = ? AND line LIKE '%github.com%pull%' 
+         ORDER BY id DESC LIMIT 1`,
+        workspaceId
+      );
+
+      if (logWithPr) {
+        const prInfo = extractPrUrl(logWithPr.line);
+        if (prInfo) {
+          return {
+            pr_url: prInfo.prUrl,
+            pr_number: prInfo.prNumber,
+            branch_name: workspace.branch_name,
+            source: "logs" as const,
+          };
+        }
+      }
+
+      // Check contributions table
+      if (workspace.issue_id) {
+        const contribution = db.get<{ pr_url: string | null; pr_number: number | null }>(
+          `SELECT pr_url, pr_number FROM contributions WHERE issue_id = ? AND pr_url IS NOT NULL ORDER BY id DESC LIMIT 1`,
+          workspace.issue_id
+        );
+
+        if (contribution?.pr_url) {
+          return {
+            pr_url: contribution.pr_url,
+            pr_number: contribution.pr_number,
+            branch_name: workspace.branch_name,
+            source: "contribution" as const,
+          };
+        }
+      }
+
+      return {
+        pr_url: null,
+        pr_number: null,
+        branch_name: workspace.branch_name,
+        source: null,
+      };
     }
   );

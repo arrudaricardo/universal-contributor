@@ -180,7 +180,8 @@ class Database {
         expires_at TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         destroyed_at TEXT,
-        error_message TEXT
+        error_message TEXT,
+        pr_url TEXT
       )
     `);
 

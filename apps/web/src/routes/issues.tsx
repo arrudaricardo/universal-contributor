@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { createFileRoute } from '@tanstack/react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { treaty } from '@elysiajs/eden'
-import { PlusIcon, ExternalLinkIcon, CircleAlertIcon, CheckIcon, CircleIcon, GitPullRequestIcon, Trash2Icon, RefreshCwIcon } from 'lucide-react'
+import { PlusIcon, ExternalLinkIcon, CircleAlertIcon, CheckIcon, CircleIcon, GitPullRequestIcon, Trash2Icon, RefreshCwIcon, FileTextIcon } from 'lucide-react'
 import type { App } from '@universal-contributor/db-api'
 
 import { Button } from '@/components/ui/button'
@@ -18,6 +18,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Empty, EmptyHeader, EmptyTitle, EmptyDescription, EmptyMedia } from '@/components/ui/empty'
 import { Spinner } from '@/components/ui/spinner'
 import { toast } from 'sonner'
@@ -45,6 +46,16 @@ interface Workspace {
   status: string
   branch_name: string | null
   error_message: string | null
+  dockerfile: string | null
+  created_at: string
+}
+
+interface WorkspaceLog {
+  id: number
+  workspace_id: number
+  line: string
+  stream: 'stdout' | 'stderr'
+  created_at: string
 }
 
 interface Agent {
@@ -65,6 +76,12 @@ const fetchIssues = async (): Promise<Issue[]> => {
   const { data, error } = await api.issues.get()
   if (error) throw new Error(String(error))
   return data as Issue[]
+}
+
+const fetchIssueById = async (issueId: number): Promise<Issue> => {
+  const { data, error } = await api.issues({ id: String(issueId) }).get()
+  if (error) throw new Error(String(error))
+  return data as Issue
 }
 
 const addIssueApi = async (issueUrl: string) => {
@@ -141,7 +158,7 @@ const spawnWorkspaceApi = async (issueId: number, agentId: number): Promise<Work
   const { data, error } = await api.workspaces.spawn.post({
     issue_id: issueId,
     agent_id: agentId,
-    timeout_minutes: 60,
+    agent_run_id: agentId,
   })
   if (error) throw new Error(String(error))
   return data as Workspace
@@ -164,10 +181,23 @@ const deleteIssueApi = async (issueId: number) => {
   if (error) throw new Error(String(error))
 }
 
+const getWorkspaceLogsApi = async (workspaceId: number, afterId?: number): Promise<WorkspaceLog[]> => {
+  const query = afterId ? { after_id: String(afterId) } : {}
+  const { data, error } = await api.workspaces({ id: String(workspaceId) }).logs.get({ query })
+  if (error) throw new Error(String(error))
+  return (data || []) as WorkspaceLog[]
+}
+
 const cancelWorkspaceApi = async (workspaceId: number) => {
   const { data, error } = await api.workspaces({ id: String(workspaceId) }).destroy.post()
   if (error) throw new Error(String(error))
   return data
+}
+
+const getWorkspacesByIssueApi = async (issueId: number): Promise<Workspace[]> => {
+  const { data, error } = await api.workspaces.get({ query: { issue_id: String(issueId) } })
+  if (error) throw new Error(String(error))
+  return (data || []) as Workspace[]
 }
 
 export const Route = createFileRoute('/issues')({
@@ -189,10 +219,22 @@ function IssuesPage() {
   const [fixDialogOpen, setFixDialogOpen] = useState(false)
   const [fixError, setFixError] = useState<string | null>(null)
   const [contribution, setContribution] = useState<Contribution | null>(null)
+  const [workspaceLogs, setWorkspaceLogs] = useState<WorkspaceLog[]>([])
+  const [lastLogId, setLastLogId] = useState<number>(0)
+  const logsContainerRef = useRef<HTMLDivElement>(null)
 
   // Delete Issue State
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
   const [issueToDelete, setIssueToDelete] = useState<Issue | null>(null)
+
+  // View Logs Dialog State
+  const [logsDialogOpen, setLogsDialogOpen] = useState(false)
+  const [logsDialogIssue, setLogsDialogIssue] = useState<Issue | null>(null)
+  const [logsDialogWorkspaces, setLogsDialogWorkspaces] = useState<Workspace[]>([])
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<number | null>(null)
+  const [historicalLogs, setHistoricalLogs] = useState<WorkspaceLog[]>([])
+  const [logsLoading, setLogsLoading] = useState(false)
+  const historicalLogsContainerRef = useRef<HTMLDivElement>(null)
 
   // Fetch issues with auto-refresh for active states
   const { data: issues, isLoading } = useQuery<Issue[]>({
@@ -231,6 +273,80 @@ function IssuesPage() {
     },
   })
 
+  // Poll workspace logs while fix dialog is open
+  useQuery({
+    queryKey: ['workspace-logs', activeWorkspace?.id, lastLogId],
+    queryFn: async () => {
+      if (!activeWorkspace) return []
+      const newLogs = await getWorkspaceLogsApi(activeWorkspace.id, lastLogId || undefined)
+      if (newLogs.length > 0) {
+        setWorkspaceLogs((prev) => [...prev, ...newLogs])
+        setLastLogId(newLogs[newLogs.length - 1].id)
+      }
+      return newLogs
+    },
+    enabled: !!activeWorkspace && fixDialogOpen,
+    refetchInterval: () => {
+      const status = activeWorkspace?.status
+      // Stop polling when complete or failed
+      if (
+        status === 'completed' ||
+        status === 'destroyed' ||
+        status === 'build_failed' ||
+        status === 'container_crashed' ||
+        status === 'timeout'
+      ) {
+        // Do one final fetch then stop
+        return false
+      }
+      return 1000 // Poll logs every 1 second
+    },
+  })
+
+  // Batch poll extracting issues to check for completion
+  const { data: polledIssues } = useQuery({
+    queryKey: ['issues-extraction-poll', Array.from(extractingIds)],
+    queryFn: async () => {
+      const results = await Promise.all(
+        Array.from(extractingIds).map((id) => fetchIssueById(id))
+      )
+      return results
+    },
+    enabled: extractingIds.size > 0,
+    refetchInterval: 2000,
+  })
+
+  // Update cache and show toasts when extraction completes
+  useEffect(() => {
+    if (!polledIssues) return
+
+    polledIssues.forEach((issue) => {
+      if (issue.status === 'extracted' || issue.status === 'error') {
+        // Update issues list cache with the new data
+        queryClient.setQueryData(['issues'], (old: Issue[] | undefined) => {
+          if (!old) return old
+          return old.map((i) => (i.id === issue.id ? issue : i))
+        })
+
+        // Remove from extracting set
+        setExtractingIds((prev) => {
+          const next = new Set(prev)
+          next.delete(issue.id)
+          return next
+        })
+
+        // Show toast notification
+        if (issue.status === 'extracted') {
+          toast.success('Issue extracted', { description: issue.title })
+        } else {
+          toast.error('Extraction failed', {
+            description: issue.ai_analysis || 'Unknown error',
+          })
+        }
+      }
+    })
+  }, [polledIssues, queryClient])
+
   // Update activeWorkspace when polling returns new data
   useEffect(() => {
     if (workspaceStatus) {
@@ -252,6 +368,13 @@ function IssuesPage() {
     }
   }, [workspaceStatus, fixingIssue, queryClient])
 
+  // Auto-scroll logs to bottom when new logs arrive
+  useEffect(() => {
+    if (logsContainerRef.current) {
+      logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight
+    }
+  }, [workspaceLogs])
+
   // Add Issue Mutation
   const addIssueMutation = useMutation({
     mutationFn: addIssueApi,
@@ -260,23 +383,12 @@ function IssuesPage() {
       setDialogOpen(false)
       queryClient.invalidateQueries({ queryKey: ['issues'] })
 
-      // Start extraction in background
+      // Start extraction in background (fire-and-forget)
+      // Polling will handle completion detection
       setExtractingIds((prev) => new Set(prev).add(result.issueId))
-      extractIssueDataApi(result.issueId)
-        .then(() => {
-          queryClient.invalidateQueries({ queryKey: ['issues'] })
-        })
-        .catch((e) => {
-          console.error('Extraction failed:', e)
-        })
-        .finally(() => {
-          setExtractingIds((prev) => {
-            const next = new Set(prev)
-            next.delete(result.issueId)
-            return next
-          })
-          queryClient.invalidateQueries({ queryKey: ['issues'] })
-        })
+      extractIssueDataApi(result.issueId).catch((e) => {
+        console.error('Extraction request failed:', e)
+      })
     },
     onError: (e: Error) => {
       setError(e.message)
@@ -328,27 +440,64 @@ function IssuesPage() {
   }
 
   const handleRetryExtraction = (issueId: number) => {
+    // Fire-and-forget - polling will handle completion detection
     setExtractingIds((prev) => new Set(prev).add(issueId))
     toast.info('Retrying extraction...')
-    
-    extractIssueDataApi(issueId)
-      .then(() => {
-        toast.success('Extraction completed successfully')
-        queryClient.invalidateQueries({ queryKey: ['issues'] })
-      })
-      .catch((e) => {
-        toast.error('Extraction failed', {
-          description: e instanceof Error ? e.message : 'Unknown error',
-        })
-      })
-      .finally(() => {
-        setExtractingIds((prev) => {
-          const next = new Set(prev)
-          next.delete(issueId)
-          return next
-        })
-        queryClient.invalidateQueries({ queryKey: ['issues'] })
-      })
+
+    extractIssueDataApi(issueId).catch((e) => {
+      console.error('Extraction request failed:', e)
+    })
+  }
+
+  // View Logs Handlers
+  const handleViewLogs = async (issue: Issue) => {
+    setLogsDialogIssue(issue)
+    setLogsDialogOpen(true)
+    setLogsLoading(true)
+    setHistoricalLogs([])
+    setSelectedWorkspaceId(null)
+
+    try {
+      const workspaces = await getWorkspacesByIssueApi(issue.id)
+      setLogsDialogWorkspaces(workspaces)
+
+      // Auto-select the most recent workspace
+      if (workspaces.length > 0) {
+        setSelectedWorkspaceId(workspaces[0].id)
+        const logs = await getWorkspaceLogsApi(workspaces[0].id)
+        setHistoricalLogs(logs)
+      }
+    } catch (err) {
+      console.error('Failed to load workspaces:', err)
+    } finally {
+      setLogsLoading(false)
+    }
+  }
+
+  const handleWorkspaceChange = async (workspaceId: string) => {
+    const id = parseInt(workspaceId)
+    setSelectedWorkspaceId(id)
+    setLogsLoading(true)
+
+    try {
+      const logs = await getWorkspaceLogsApi(id)
+      setHistoricalLogs(logs)
+    } catch (err) {
+      console.error('Failed to load logs:', err)
+    } finally {
+      setLogsLoading(false)
+    }
+  }
+
+  const formatWorkspaceOption = (workspace: Workspace): string => {
+    const date = new Date(workspace.created_at)
+    const dateStr = date.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    })
+    return `#${workspace.id} - ${workspace.status} (${dateStr})`
   }
 
   const submitIssue = () => {
@@ -364,6 +513,8 @@ function IssuesPage() {
     setActiveWorkspace(null)
     setFixError(null)
     setContribution(null)
+    setWorkspaceLogs([])
+    setLastLogId(0)
 
     try {
       // Get or create agent
@@ -392,6 +543,7 @@ function IssuesPage() {
       case 'fixing':
         return 'secondary'
       case 'open':
+      case 'extracted':
         return 'default'
       case 'fixed':
         return 'outline'
@@ -430,6 +582,16 @@ function IssuesPage() {
     } catch {
       return []
     }
+  }
+
+  const formatLogTimestamp = (createdAt: string): string => {
+    const date = new Date(createdAt)
+    return date.toLocaleTimeString('en-US', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    })
   }
 
   const formatErrorMessage = (errorJson: string | null): string => {
@@ -618,6 +780,27 @@ function IssuesPage() {
                 </div>
               </div>
 
+              {/* Execution Logs */}
+              {workspaceLogs.length > 0 && (
+                <div className="space-y-2">
+                  <span className="text-sm font-medium">Logs:</span>
+                  <div
+                    ref={logsContainerRef}
+                    className="rounded-md bg-muted/50 p-3 max-h-60 overflow-auto font-mono text-xs"
+                  >
+                    {workspaceLogs.map((log) => (
+                      <div
+                        key={log.id}
+                        className={log.stream === 'stderr' ? 'text-destructive' : 'text-foreground/80'}
+                      >
+                        <span className="text-muted-foreground">[{formatLogTimestamp(log.created_at)}]</span>{' '}
+                        {log.line}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Initial Error (before workspace created) */}
               {fixError && (
                 <div className="rounded-md bg-destructive/10 p-4">
@@ -720,6 +903,78 @@ function IssuesPage() {
           </DialogContent>
         </Dialog>
 
+        {/* View Logs Dialog */}
+        <Dialog open={logsDialogOpen} onOpenChange={setLogsDialogOpen}>
+          <DialogContent className="max-w-2xl max-h-[80vh] flex flex-col">
+            <DialogHeader>
+              <DialogTitle>Logs for Issue #{logsDialogIssue?.github_issue_number}</DialogTitle>
+              <DialogDescription className="truncate">
+                {logsDialogIssue?.title}
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="flex-1 space-y-4 py-4 overflow-hidden flex flex-col min-h-0">
+              {/* Workspace Selector */}
+              {logsDialogWorkspaces.length > 0 && (
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium">Workspace:</span>
+                  <Select
+                    value={selectedWorkspaceId?.toString() || ''}
+                    onValueChange={handleWorkspaceChange}
+                  >
+                    <SelectTrigger className="w-70">
+                      <SelectValue placeholder="Select workspace" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {logsDialogWorkspaces.map((ws) => (
+                        <SelectItem key={ws.id} value={ws.id.toString()}>
+                          {formatWorkspaceOption(ws)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+
+              {/* Logs Display */}
+              {logsLoading ? (
+                <div className="flex items-center justify-center py-8">
+                  <Spinner className="size-6" />
+                </div>
+              ) : logsDialogWorkspaces.length === 0 ? (
+                <div className="text-center text-muted-foreground py-8">
+                  No workspaces found for this issue.
+                </div>
+              ) : historicalLogs.length === 0 ? (
+                <div className="text-center text-muted-foreground py-8">
+                  No logs available for this workspace.
+                </div>
+              ) : (
+                <div
+                  ref={historicalLogsContainerRef}
+                  className="flex-1 rounded-md bg-muted/50 p-3 overflow-auto font-mono text-xs min-h-0"
+                >
+                  {historicalLogs.map((log) => (
+                    <div
+                      key={log.id}
+                      className={log.stream === 'stderr' ? 'text-destructive' : 'text-foreground/80'}
+                    >
+                      <span className="text-muted-foreground">[{formatLogTimestamp(log.created_at)}]</span>{' '}
+                      {log.line}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setLogsDialogOpen(false)}>
+                Close
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         {/* Issues List */}
         {isLoading ? (
           <div className="flex items-center justify-center py-12">
@@ -812,6 +1067,15 @@ function IssuesPage() {
                           )}
                         </Button>
                       )}
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => handleViewLogs(issue)}
+                        className="text-muted-foreground hover:text-foreground"
+                        title="View logs"
+                      >
+                        <FileTextIcon className="size-4" />
+                      </Button>
                       <Button
                         variant="ghost"
                         size="icon"

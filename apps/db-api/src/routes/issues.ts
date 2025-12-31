@@ -3,6 +3,7 @@ import { dbPlugin } from "../db-plugin";
 import Firecrawl from "firecrawl";
 import { chat } from "@tanstack/ai";
 import { openaiText } from "@tanstack/ai-openai";
+import type { Database } from "../../../../packages/shared/src/db";
 
 export interface Issue {
   id: number;
@@ -40,6 +41,294 @@ export interface RepositoryEnvironment {
   docker_image: string | null;
   discovered_at: string;
   last_updated_at: string | null;
+}
+
+// Helper function to run extraction in background
+async function extractIssueData(
+  db: Database,
+  issue: Issue,
+  repo: { id: number; full_name: string; language: string | null },
+  issueId: number
+): Promise<void> {
+  try {
+    const firecrawl = new Firecrawl({
+      apiKey: process.env.FIRECRAWL_API_KEY!,
+    });
+
+    // Define the schema for issue extraction
+    const IssueDataSchema = {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "The issue title" },
+        body: { type: "string", description: "The full issue description/body text" },
+        labels: { type: "array", items: { type: "string" }, description: "Array of label names" },
+        state: { type: "string", description: "The issue state (open or closed)" },
+        author: { type: "string", description: "The GitHub username who created the issue" },
+        createdAt: { type: "string", description: "When the issue was created" },
+      },
+      required: ["title", "body", "labels", "state", "author", "createdAt"],
+    };
+
+    // Define the schema for repository extraction with environment info
+    const RepoDataSchema = {
+      type: "object",
+      properties: {
+        description: { type: ["string", "null"], description: "The repository description" },
+        stars: { type: "number", description: "Number of stars" },
+        forks: { type: "number", description: "Number of forks" },
+        language: { type: ["string", "null"], description: "Primary programming language" },
+        defaultBranch: { type: "string", description: "The default branch name" },
+        hasPackageJson: { type: "boolean", description: "true if package.json exists in the root" },
+        hasRequirementsTxt: { type: "boolean", description: "true if requirements.txt exists in the root" },
+        hasPyprojectToml: { type: "boolean", description: "true if pyproject.toml exists in the root" },
+        hasCargoToml: { type: "boolean", description: "true if Cargo.toml exists in the root" },
+        hasGoMod: { type: "boolean", description: "true if go.mod exists in the root" },
+        hasPomXml: { type: "boolean", description: "true if pom.xml exists in the root" },
+        hasGradleBuild: { type: "boolean", description: "true if build.gradle or build.gradle.kts exists in the root" },
+        hasMakefile: { type: "boolean", description: "true if Makefile exists in the root" },
+        hasDockerfile: { type: "boolean", description: "true if Dockerfile exists in the root" },
+        readmeSetupInstructions: { type: ["string", "null"], description: "Setup/installation instructions from README (max 500 chars)" },
+      },
+      required: ["description", "stars", "forks", "language", "defaultBranch", "hasPackageJson", "hasRequirementsTxt", "hasPyprojectToml", "hasCargoToml", "hasGoMod", "hasPomXml", "hasGradleBuild", "hasMakefile", "hasDockerfile", "readmeSetupInstructions"],
+    };
+
+    // Extract issue data using Firecrawl
+    const issueResponse = await firecrawl.scrape(issue.url, {
+      formats: [
+        {
+          type: "json",
+          schema: IssueDataSchema,
+          prompt: `Extract the following information from this GitHub issue page:
+            - title: The issue title
+            - body: The full issue description/body text
+            - labels: Array of label names (e.g., ["bug", "help wanted"])
+            - state: The issue state (open or closed)
+            - author: The GitHub username who created the issue
+            - createdAt: When the issue was created`,
+        },
+      ],
+    });
+
+    const issueResult = {
+      parsed: issueResponse.json as {
+        title: string;
+        body: string;
+        labels: string[];
+        state: string;
+        author: string;
+        createdAt: string;
+      } | undefined,
+    };
+
+    // Extract repository data with environment info
+    const repoUrl = `https://github.com/${repo.full_name}`;
+    const repoResponse = await firecrawl.scrape(repoUrl, {
+      formats: [
+        {
+          type: "json",
+          schema: RepoDataSchema,
+          prompt: `Extract the following information from this GitHub repository page:
+            - description: The repository description (can be null if none)
+            - stars: Number of stars (as a number)
+            - forks: Number of forks (as a number)
+            - language: Primary programming language (can be null)
+            - defaultBranch: The default branch name (e.g., "main" or "master")
+
+            Look at the file tree in the repository root and determine:
+            - hasPackageJson: true if package.json exists in the root
+            - hasRequirementsTxt: true if requirements.txt exists in the root
+            - hasPyprojectToml: true if pyproject.toml exists in the root
+            - hasCargoToml: true if Cargo.toml exists in the root
+            - hasGoMod: true if go.mod exists in the root
+            - hasPomXml: true if pom.xml exists in the root
+            - hasGradleBuild: true if build.gradle or build.gradle.kts exists in the root
+            - hasMakefile: true if Makefile exists in the root
+            - hasDockerfile: true if Dockerfile exists in the root
+
+            Also look at the README file and extract:
+            - readmeSetupInstructions: Any setup/installation instructions found in the README (summarize in 500 chars max, or null if none found)`,
+        },
+      ],
+    });
+
+    const repoResult = {
+      parsed: repoResponse.json as {
+        description: string | null;
+        stars: number;
+        forks: number;
+        language: string | null;
+        defaultBranch: string;
+        hasPackageJson: boolean;
+        hasRequirementsTxt: boolean;
+        hasPyprojectToml: boolean;
+        hasCargoToml: boolean;
+        hasGoMod: boolean;
+        hasPomXml: boolean;
+        hasGradleBuild: boolean;
+        hasMakefile: boolean;
+        hasDockerfile: boolean;
+        readmeSetupInstructions: string | null;
+      } | undefined,
+    };
+
+    // Update issue with extracted data
+    const labelsJson = JSON.stringify(issueResult.parsed?.labels);
+    const labelsArray = issueResult.parsed?.labels || [];
+
+    db.run(
+      `UPDATE issues SET title = ?, body = ?, labels = ?,
+       has_good_first_issue = ?, has_help_wanted = ?, has_bug_label = ? WHERE id = ?`,
+      issueResult.parsed?.title || "",
+      issueResult.parsed?.body || "",
+      labelsJson,
+      labelsArray.some((l: string) => l.toLowerCase().includes("good first issue")) ? 1 : 0,
+      labelsArray.some((l: string) => l.toLowerCase().includes("help wanted")) ? 1 : 0,
+      labelsArray.some((l: string) => l.toLowerCase().includes("bug")) ? 1 : 0,
+      issueId
+    );
+
+    // Update repository with extracted data
+    db.run(
+      `UPDATE repositories SET description = ?, stars = ?, forks = ?, language = ?, last_checked_at = datetime('now') WHERE id = ?`,
+      repoResult.parsed?.description || "",
+      repoResult.parsed?.stars || 0,
+      repoResult.parsed?.forks || 0,
+      repoResult.parsed?.language || "",
+      repo.id
+    );
+
+    // Update or insert repository environment
+    const repoEnvData = repoResult.parsed;
+    if (repoEnvData) {
+      // Determine runtime and package manager based on detected files
+      let runtime: string | null = null;
+      let packageManager: string | null = null;
+      let setupCommands: string | null = null;
+      let testCommands: string | null = null;
+
+      if (repoEnvData.hasPackageJson) {
+        runtime = "node";
+        packageManager = "npm";
+        setupCommands = "npm install";
+        testCommands = "npm test";
+      } else if (repoEnvData.hasRequirementsTxt) {
+        runtime = "python";
+        packageManager = "pip";
+        setupCommands = "pip install -r requirements.txt";
+        testCommands = "pytest";
+      } else if (repoEnvData.hasPyprojectToml) {
+        runtime = "python";
+        packageManager = "poetry";
+        setupCommands = "poetry install";
+        testCommands = "poetry run pytest";
+      } else if (repoEnvData.hasCargoToml) {
+        runtime = "rust";
+        packageManager = "cargo";
+        setupCommands = "cargo build";
+        testCommands = "cargo test";
+      } else if (repoEnvData.hasGoMod) {
+        runtime = "go";
+        packageManager = "go";
+        setupCommands = "go mod download";
+        testCommands = "go test ./...";
+      } else if (repoEnvData.hasPomXml) {
+        runtime = "java";
+        packageManager = "maven";
+        setupCommands = "mvn install";
+        testCommands = "mvn test";
+      } else if (repoEnvData.hasGradleBuild) {
+        runtime = "java";
+        packageManager = "gradle";
+        setupCommands = "./gradlew build";
+        testCommands = "./gradlew test";
+      }
+
+      // Check if environment record exists
+      const existingEnv = db.get<RepositoryEnvironment>(
+        `SELECT * FROM repository_environments WHERE repository_id = ?`,
+        repo.id
+      );
+
+      if (existingEnv) {
+        db.run(
+          `UPDATE repository_environments SET
+            primary_language = ?, runtime = ?, package_manager = ?,
+            setup_commands = ?, test_commands = ?, last_updated_at = datetime('now')
+           WHERE repository_id = ?`,
+          repoEnvData.language,
+          runtime,
+          packageManager,
+          setupCommands,
+          testCommands,
+          repo.id
+        );
+      } else {
+        db.run(
+          `INSERT INTO repository_environments
+            (repository_id, primary_language, runtime, package_manager, setup_commands, test_commands)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          repo.id,
+          repoEnvData.language,
+          runtime,
+          packageManager,
+          setupCommands,
+          testCommands
+        );
+      }
+    }
+
+    // Generate AI fix prompt
+    const issueData = issueResult.parsed;
+    const aiFixPrompt = await chat({
+      adapter: openaiText("gpt-4o"),
+      messages: [{
+        role: "user",
+        content: `Generate a detailed prompt for an AI coding agent (OpenCode) to fix this GitHub issue.
+
+Repository: ${repo.full_name}
+URL: https://github.com/${repo.full_name}
+Primary Language: ${repoResult.parsed?.language || repo.language || "Unknown"}
+Default Branch: ${repoResult.parsed?.defaultBranch || "main"}
+
+Issue #${issue.github_issue_number}: ${issueData?.title || issue.title}
+
+Description:
+${issueData?.body || issue.body || "No description provided"}
+
+Labels: ${(issueData?.labels || []).join(", ") || "None"}
+
+The prompt should instruct the AI coding agent to:
+1. Understand and analyze the issue thoroughly
+2. Find relevant code files in the repository
+3. Make minimal, targeted changes to fix the issue
+4. Run tests if available to verify the fix works
+5. Create a git branch named 'fix/issue-${issue.github_issue_number}'
+6. Commit changes with a descriptive message referencing the issue
+7. Push the branch and create a pull request
+
+The prompt should be self-contained and provide enough context for the AI to work autonomously.
+Output ONLY the prompt text, no explanations or meta-commentary.`
+      }],
+      stream: false,
+    });
+
+    // Update issue with AI fix prompt and set status to 'extracted'
+    db.run(
+      `UPDATE issues SET ai_fix_prompt = ?, status = ? WHERE id = ?`,
+      aiFixPrompt,
+      "extracted",
+      issueId
+    );
+  } catch (error) {
+    // Update status to 'error' on failure
+    db.run(
+      `UPDATE issues SET status = ?, ai_analysis = ? WHERE id = ?`,
+      "error",
+      error instanceof Error ? error.message : "Unknown error during extraction",
+      issueId
+    );
+    console.error(`Extraction failed for issue ${issueId}:`, error);
+  }
 }
 
 export const issuesRoutes = new Elysia({ prefix: "/issues" })
@@ -200,12 +489,47 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
     }
   )
   .delete("/:id", ({ db, params }) => {
-    db.run(`DELETE FROM issues WHERE id = ?`, parseInt(params.id));
+    const issueId = parseInt(params.id);
+
+    // Get workspace IDs for this issue to delete their logs
+    const workspaces = db.query<{ id: number }>(
+      `SELECT id FROM workspaces WHERE issue_id = ?`,
+      issueId
+    );
+
+    // Delete workspace logs for all workspaces related to this issue
+    for (const workspace of workspaces) {
+      db.run(`DELETE FROM workspace_logs WHERE workspace_id = ?`, workspace.id);
+    }
+
+    // Delete workspaces referencing this issue
+    db.run(`DELETE FROM workspaces WHERE issue_id = ?`, issueId);
+
+    // Get contribution IDs for this issue to delete their webhooks
+    const contributions = db.query<{ id: number }>(
+      `SELECT id FROM contributions WHERE issue_id = ?`,
+      issueId
+    );
+
+    // Delete webhooks for all contributions related to this issue
+    for (const contribution of contributions) {
+      db.run(`DELETE FROM webhooks WHERE contribution_id = ?`, contribution.id);
+    }
+
+    // Delete contributions referencing this issue
+    db.run(`DELETE FROM contributions WHERE issue_id = ?`, issueId);
+
+    // Delete agent_runs referencing this issue
+    db.run(`DELETE FROM agent_runs WHERE issue_id = ?`, issueId);
+
+    // Finally delete the issue
+    db.run(`DELETE FROM issues WHERE id = ?`, issueId);
+
     return { success: true };
   })
   .post(
     "/:id/extract",
-    async ({ db, params }) => {
+    ({ db, params }) => {
       const issueId = parseInt(params.id);
       const issue = db.get<Issue>(
         `SELECT * FROM issues WHERE id = ?`,
@@ -233,287 +557,11 @@ export const issuesRoutes = new Elysia({ prefix: "/issues" })
         issueId
       );
 
-      try {
-        const firecrawl = new Firecrawl({
-          apiKey: process.env.FIRECRAWL_API_KEY!,
-        });
+      // Start extraction in background (fire-and-forget)
+      extractIssueData(db, issue, repo, issueId);
 
-        // Define the schema for issue extraction
-        const IssueDataSchema = {
-          type: "object",
-          properties: {
-            title: { type: "string", description: "The issue title" },
-            body: { type: "string", description: "The full issue description/body text" },
-            labels: { type: "array", items: { type: "string" }, description: "Array of label names" },
-            state: { type: "string", description: "The issue state (open or closed)" },
-            author: { type: "string", description: "The GitHub username who created the issue" },
-            createdAt: { type: "string", description: "When the issue was created" },
-          },
-          required: ["title", "body", "labels", "state", "author", "createdAt"],
-        };
-
-        // Define the schema for repository extraction with environment info
-        const RepoDataSchema = {
-          type: "object",
-          properties: {
-            description: { type: ["string", "null"], description: "The repository description" },
-            stars: { type: "number", description: "Number of stars" },
-            forks: { type: "number", description: "Number of forks" },
-            language: { type: ["string", "null"], description: "Primary programming language" },
-            defaultBranch: { type: "string", description: "The default branch name" },
-            hasPackageJson: { type: "boolean", description: "true if package.json exists in the root" },
-            hasRequirementsTxt: { type: "boolean", description: "true if requirements.txt exists in the root" },
-            hasPyprojectToml: { type: "boolean", description: "true if pyproject.toml exists in the root" },
-            hasCargoToml: { type: "boolean", description: "true if Cargo.toml exists in the root" },
-            hasGoMod: { type: "boolean", description: "true if go.mod exists in the root" },
-            hasPomXml: { type: "boolean", description: "true if pom.xml exists in the root" },
-            hasGradleBuild: { type: "boolean", description: "true if build.gradle or build.gradle.kts exists in the root" },
-            hasMakefile: { type: "boolean", description: "true if Makefile exists in the root" },
-            hasDockerfile: { type: "boolean", description: "true if Dockerfile exists in the root" },
-            readmeSetupInstructions: { type: ["string", "null"], description: "Setup/installation instructions from README (max 500 chars)" },
-          },
-          required: ["description", "stars", "forks", "language", "defaultBranch", "hasPackageJson", "hasRequirementsTxt", "hasPyprojectToml", "hasCargoToml", "hasGoMod", "hasPomXml", "hasGradleBuild", "hasMakefile", "hasDockerfile", "readmeSetupInstructions"],
-        };
-
-        // Extract issue data using Firecrawl
-        const issueResponse = await firecrawl.scrape(issue.url, {
-          formats: [
-            {
-              type: "json",
-              schema: IssueDataSchema,
-              prompt: `Extract the following information from this GitHub issue page:
-                - title: The issue title
-                - body: The full issue description/body text
-                - labels: Array of label names (e.g., ["bug", "help wanted"])
-                - state: The issue state (open or closed)
-                - author: The GitHub username who created the issue
-                - createdAt: When the issue was created`,
-            },
-          ],
-        });
-
-        const issueResult = {
-          parsed: issueResponse.json as {
-            title: string;
-            body: string;
-            labels: string[];
-            state: string;
-            author: string;
-            createdAt: string;
-          } | undefined,
-        };
-
-        // Extract repository data with environment info
-        const repoUrl = `https://github.com/${repo.full_name}`;
-        const repoResponse = await firecrawl.scrape(repoUrl, {
-          formats: [
-            {
-              type: "json",
-              schema: RepoDataSchema,
-              prompt: `Extract the following information from this GitHub repository page:
-                - description: The repository description (can be null if none)
-                - stars: Number of stars (as a number)
-                - forks: Number of forks (as a number)
-                - language: Primary programming language (can be null)
-                - defaultBranch: The default branch name (e.g., "main" or "master")
-
-                Look at the file tree in the repository root and determine:
-                - hasPackageJson: true if package.json exists in the root
-                - hasRequirementsTxt: true if requirements.txt exists in the root
-                - hasPyprojectToml: true if pyproject.toml exists in the root
-                - hasCargoToml: true if Cargo.toml exists in the root
-                - hasGoMod: true if go.mod exists in the root
-                - hasPomXml: true if pom.xml exists in the root
-                - hasGradleBuild: true if build.gradle or build.gradle.kts exists in the root
-                - hasMakefile: true if Makefile exists in the root
-                - hasDockerfile: true if Dockerfile exists in the root
-
-                Also look at the README file and extract:
-                - readmeSetupInstructions: Any setup/installation instructions found in the README (summarize in 500 chars max, or null if none found)`,
-            },
-          ],
-        });
-
-        const repoResult = {
-          parsed: repoResponse.json as {
-            description: string | null;
-            stars: number;
-            forks: number;
-            language: string | null;
-            defaultBranch: string;
-            hasPackageJson: boolean;
-            hasRequirementsTxt: boolean;
-            hasPyprojectToml: boolean;
-            hasCargoToml: boolean;
-            hasGoMod: boolean;
-            hasPomXml: boolean;
-            hasGradleBuild: boolean;
-            hasMakefile: boolean;
-            hasDockerfile: boolean;
-            readmeSetupInstructions: string | null;
-          } | undefined,
-        };
-
-        // Update issue with extracted data
-        const labelsJson = JSON.stringify(issueResult.parsed?.labels);
-        const labelsArray = issueResult.parsed?.labels || [];
-
-        db.run(
-          `UPDATE issues SET title = ?, body = ?, labels = ?, status = ?,
-           has_good_first_issue = ?, has_help_wanted = ?, has_bug_label = ? WHERE id = ?`,
-          issueResult.parsed?.title || "",
-          issueResult.parsed?.body || "",
-          labelsJson,
-          issueResult.parsed?.state || "open",
-          labelsArray.some((l: string) => l.toLowerCase().includes("good first issue")) ? 1 : 0,
-          labelsArray.some((l: string) => l.toLowerCase().includes("help wanted")) ? 1 : 0,
-          labelsArray.some((l: string) => l.toLowerCase().includes("bug")) ? 1 : 0,
-          issueId
-        );
-
-        // Update repository with extracted data
-        db.run(
-          `UPDATE repositories SET description = ?, stars = ?, forks = ?, language = ?, last_checked_at = datetime('now') WHERE id = ?`,
-          repoResult.parsed?.description || "",
-          repoResult.parsed?.stars || 0,
-          repoResult.parsed?.forks || 0,
-          repoResult.parsed?.language || "",
-          repo.id
-        );
-
-        // Update or insert repository environment
-        const repoEnvData = repoResult.parsed;
-        if (repoEnvData) {
-          // Determine runtime and package manager based on detected files
-          let runtime: string | null = null;
-          let packageManager: string | null = null;
-          let setupCommands: string | null = null;
-          let testCommands: string | null = null;
-
-          if (repoEnvData.hasPackageJson) {
-            runtime = "node";
-            packageManager = "npm";
-            setupCommands = "npm install";
-            testCommands = "npm test";
-          } else if (repoEnvData.hasRequirementsTxt) {
-            runtime = "python";
-            packageManager = "pip";
-            setupCommands = "pip install -r requirements.txt";
-            testCommands = "pytest";
-          } else if (repoEnvData.hasPyprojectToml) {
-            runtime = "python";
-            packageManager = "poetry";
-            setupCommands = "poetry install";
-            testCommands = "poetry run pytest";
-          } else if (repoEnvData.hasCargoToml) {
-            runtime = "rust";
-            packageManager = "cargo";
-            setupCommands = "cargo build";
-            testCommands = "cargo test";
-          } else if (repoEnvData.hasGoMod) {
-            runtime = "go";
-            packageManager = "go";
-            setupCommands = "go mod download";
-            testCommands = "go test ./...";
-          } else if (repoEnvData.hasPomXml) {
-            runtime = "java";
-            packageManager = "maven";
-            setupCommands = "mvn install";
-            testCommands = "mvn test";
-          } else if (repoEnvData.hasGradleBuild) {
-            runtime = "java";
-            packageManager = "gradle";
-            setupCommands = "./gradlew build";
-            testCommands = "./gradlew test";
-          }
-
-          // Check if environment record exists
-          const existingEnv = db.get<RepositoryEnvironment>(
-            `SELECT * FROM repository_environments WHERE repository_id = ?`,
-            repo.id
-          );
-
-          if (existingEnv) {
-            db.run(
-              `UPDATE repository_environments SET
-                primary_language = ?, runtime = ?, package_manager = ?,
-                setup_commands = ?, test_commands = ?, last_updated_at = datetime('now')
-               WHERE repository_id = ?`,
-              repoEnvData.language,
-              runtime,
-              packageManager,
-              setupCommands,
-              testCommands,
-              repo.id
-            );
-          } else {
-            db.run(
-              `INSERT INTO repository_environments
-                (repository_id, primary_language, runtime, package_manager, setup_commands, test_commands)
-               VALUES (?, ?, ?, ?, ?, ?)`,
-              repo.id,
-              repoEnvData.language,
-              runtime,
-              packageManager,
-              setupCommands,
-              testCommands
-            );
-          }
-        }
-
-        // Generate AI fix prompt
-        const issueData = issueResult.parsed;
-        const aiFixPrompt = await chat({
-          adapter: openaiText("gpt-4o"),
-          messages: [{
-            role: "user",
-            content: `Generate a detailed prompt for an AI coding agent (OpenCode) to fix this GitHub issue.
-
-Repository: ${repo.full_name}
-URL: https://github.com/${repo.full_name}
-Primary Language: ${repoResult.parsed?.language || repo.language || "Unknown"}
-Default Branch: ${repoResult.parsed?.defaultBranch || "main"}
-
-Issue #${issue.github_issue_number}: ${issueData?.title || issue.title}
-
-Description:
-${issueData?.body || issue.body || "No description provided"}
-
-Labels: ${(issueData?.labels || []).join(", ") || "None"}
-
-The prompt should instruct the AI coding agent to:
-1. Understand and analyze the issue thoroughly
-2. Find relevant code files in the repository
-3. Make minimal, targeted changes to fix the issue
-4. Run tests if available to verify the fix works
-5. Create a git branch named 'fix/issue-${issue.github_issue_number}'
-6. Commit changes with a descriptive message referencing the issue
-7. Push the branch and create a pull request
-
-The prompt should be self-contained and provide enough context for the AI to work autonomously.
-Output ONLY the prompt text, no explanations or meta-commentary.`
-          }],
-          stream: false,
-        });
-
-        // Update issue with AI fix prompt
-        db.run(
-          `UPDATE issues SET ai_fix_prompt = ? WHERE id = ?`,
-          aiFixPrompt,
-          issueId
-        );
-
-        return { success: true };
-      } catch (error) {
-        // Update status to 'error' on failure
-        db.run(
-          `UPDATE issues SET status = ?, ai_analysis = ? WHERE id = ?`,
-          "error",
-          error instanceof Error ? error.message : "Unknown error during extraction",
-          issueId
-        );
-        throw error;
-      }
+      // Return immediately
+      return { success: true, status: "extracting" };
     }
   )
   .post(

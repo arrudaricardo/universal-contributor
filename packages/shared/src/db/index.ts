@@ -177,9 +177,36 @@ export class Database {
         expires_at TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         destroyed_at TEXT,
-        error_message TEXT
+        error_message TEXT,
+        dockerfile TEXT,
+        pr_url TEXT
       )
     `);
+
+    // Workspace logs: line-by-line execution logs for efficient append
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS workspace_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+        line TEXT NOT NULL,
+        stream TEXT DEFAULT 'stdout',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+
+    // Migrations: Add new columns to existing tables
+    // SQLite doesn't support IF NOT EXISTS for columns, so we use try/catch
+    try {
+      this.db.run(`ALTER TABLE workspaces ADD COLUMN dockerfile TEXT`);
+    } catch {
+      // Column already exists, ignore
+    }
+
+    try {
+      this.db.run(`ALTER TABLE workspaces ADD COLUMN pr_url TEXT`);
+    } catch {
+      // Column already exists, ignore
+    }
 
     // Default config values
     this.db.run(`INSERT OR IGNORE INTO config (key, value) VALUES ('max_concurrent_agents', '1')`);
@@ -198,6 +225,7 @@ export class Database {
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_workspaces_agent ON workspaces(agent_id)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_workspaces_status ON workspaces(status)`);
     this.db.run(`CREATE INDEX IF NOT EXISTS idx_workspaces_expires ON workspaces(expires_at)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_workspace_logs_workspace ON workspace_logs(workspace_id)`);
   }
 
   query<T>(sql: string, ...params: SQLQueryBindings[]): T[] {

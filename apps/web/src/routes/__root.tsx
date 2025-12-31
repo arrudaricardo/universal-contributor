@@ -7,7 +7,6 @@ import { Toaster } from '@/components/ui/sonner'
 const queryClient = new QueryClient()
 
 
-import Header from '../components/Header'
 
 import appCss from '../styles.css?url'
 
@@ -43,7 +42,6 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         <HeadContent />
       </head>
       <body>
-        <Header />
         <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
         <TanStackDevtools
           config={{
