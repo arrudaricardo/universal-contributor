@@ -15,11 +15,11 @@
     "start": "bun src/index.ts"
   },
   "dependencies": {
-    "@docker/node-sdk": "^0.0.17",
     "@elysiajs/cors": "^1.1.1",
     "@tanstack/ai": "^0.2.0",
     "@tanstack/ai-gemini": "^0.2.0",
     "@tanstack/ai-openai": "^0.2.0",
+    "@universal-contributor/shared": "workspace:*",
     "elysia": "^1.2.25",
     "firecrawl": "^4.10.0",
     "zod": "^4.2.1"

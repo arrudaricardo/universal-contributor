@@ -2,30 +2,15 @@ import { Elysia, t } from "elysia";
 import { dbPlugin } from "../db-plugin";
 import { chat } from "@tanstack/ai";
 import { openaiText } from "@tanstack/ai-openai";
-import { mkdtemp, writeFile, rm } from "fs/promises";
-import { tmpdir, homedir } from "os";
-import { join } from "path";
-import { spawn } from "child_process";
-
-// Helper to run docker CLI commands
-async function runDockerCommand(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  return new Promise((resolve) => {
-    const proc = spawn("docker", args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    
-    proc.stdout?.on("data", (data) => { stdout += data.toString(); });
-    proc.stderr?.on("data", (data) => { stderr += data.toString(); });
-    
-    proc.on("close", (exitCode) => {
-      resolve({ stdout, stderr, exitCode: exitCode ?? 1 });
-    });
-    
-    proc.on("error", (err) => {
-      resolve({ stdout, stderr: err.message, exitCode: 1 });
-    });
-  });
-}
+import { homedir } from "os";
+import {
+  checkDockerAvailable,
+  buildImageFromDockerfile,
+  createAndStartContainer,
+  stopAndRemoveContainer,
+  execInContainer,
+  createLineBufferedStream,
+} from "@universal-contributor/shared/docker";
 
 // Helper to sleep for a given number of milliseconds
 function sleep(ms: number): Promise<void> {
@@ -91,210 +76,60 @@ Instructions:
     `[System] Starting OpenCode to fix issue #${issue.github_issue_number}...`
   );
 
-  // Spawn docker exec process
-  const proc = spawn("docker", [
-    "exec",
-    containerId,
-    "/home/ubuntu/.opencode/bin/opencode",
-    "run",
-    prompt,
-  ], { stdio: ["pipe", "pipe", "pipe"] });
-
-  let stdoutBuffer = "";
-  let stderrBuffer = "";
-
-  // Process stdout data and insert each line into the database
-  proc.stdout?.on("data", (data) => {
-    stdoutBuffer += data.toString();
-    const lines = stdoutBuffer.split("\n");
-    // Keep the last incomplete line in the buffer
-    stdoutBuffer = lines.pop() || "";
-    
-    for (const line of lines) {
-      if (line.trim()) {
-        db.run(
-          `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
-          workspaceId,
-          line
-        );
-        console.log(`[Workspace ${workspaceId}] stdout: ${line.slice(0, 100)}...`);
-
-        // Check for PR URL and update workspace (always update with latest)
-        const prInfo = extractPrUrl(line);
-        if (prInfo) {
-          db.run(
-            `UPDATE workspaces SET pr_url = ? WHERE id = ?`,
-            prInfo.prUrl,
-            workspaceId
-          );
-          console.log(`[Workspace ${workspaceId}] Detected PR URL: ${prInfo.prUrl}`);
-        }
-      }
-    }
-  });
-
-  // Process stderr data and insert each line into the database
-  proc.stderr?.on("data", (data) => {
-    stderrBuffer += data.toString();
-    const lines = stderrBuffer.split("\n");
-    // Keep the last incomplete line in the buffer
-    stderrBuffer = lines.pop() || "";
-    
-    for (const line of lines) {
-      if (line.trim()) {
-        db.run(
-          `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stderr')`,
-          workspaceId,
-          line
-        );
-        console.log(`[Workspace ${workspaceId}] stderr: ${line.slice(0, 100)}...`);
-      }
-    }
-  });
-
-  // Handle process completion
-  proc.on("close", async (exitCode) => {
-    console.log(`[Workspace ${workspaceId}] OpenCode exited with code ${exitCode}`);
-    
-    // Flush any remaining buffered output
-    if (stdoutBuffer.trim()) {
-      db.run(
-        `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
-        workspaceId,
-        stdoutBuffer
-      );
-    }
-    if (stderrBuffer.trim()) {
-      db.run(
-        `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stderr')`,
-        workspaceId,
-        stderrBuffer
-      );
-    }
-
-    // Log completion
+  // Create line-buffered streams for stdout and stderr
+  const { stream: stdoutStream, flush: flushStdout } = createLineBufferedStream((line) => {
     db.run(
       `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
       workspaceId,
-      `[System] OpenCode execution completed with exit code ${exitCode}`
+      line
     );
+    console.log(`[Workspace ${workspaceId}] stdout: ${line.slice(0, 100)}...`);
 
-    // Update workspace status based on result
-    if (exitCode === 0) {
+    // Check for PR URL and update workspace (always update with latest)
+    const prInfo = extractPrUrl(line);
+    if (prInfo) {
       db.run(
-        `UPDATE workspaces SET status = 'completed' WHERE id = ?`,
+        `UPDATE workspaces SET pr_url = ? WHERE id = ?`,
+        prInfo.prUrl,
         workspaceId
       );
-      console.log(`[Workspace ${workspaceId}] Marked as completed`);
-
-      // Create or update contribution record if PR was created
-      const completedWorkspace = db.get<Workspace>(
-        `SELECT * FROM workspaces WHERE id = ?`,
-        workspaceId
-      );
-
-      if (completedWorkspace?.pr_url && completedWorkspace.issue_id && completedWorkspace.agent_run_id) {
-        const prNumberMatch = completedWorkspace.pr_url.match(/\/pull\/(\d+)/);
-        const prNumber = prNumberMatch?.[1] ? parseInt(prNumberMatch[1]) : null;
-
-        // Check if contribution already exists for this issue
-        const existingContribution = db.get<{ id: number }>(
-          `SELECT id FROM contributions WHERE issue_id = ?`,
-          completedWorkspace.issue_id
-        );
-
-        if (existingContribution) {
-          // Update existing contribution with PR info
-          db.run(
-            `UPDATE contributions SET pr_url = ?, pr_number = ?, branch_name = ?, status = ?, updated_at = datetime('now') WHERE id = ?`,
-            completedWorkspace.pr_url,
-            prNumber,
-            completedWorkspace.branch_name,
-            "pr_open",
-            existingContribution.id
-          );
-          console.log(`[Workspace ${workspaceId}] Updated contribution ${existingContribution.id} with PR ${completedWorkspace.pr_url}`);
-        } else {
-          // Create new contribution
-          db.run(
-            `INSERT INTO contributions (agent_run_id, issue_id, pr_url, pr_number, branch_name, status) 
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            completedWorkspace.agent_run_id,
-            completedWorkspace.issue_id,
-            completedWorkspace.pr_url,
-            prNumber,
-            completedWorkspace.branch_name,
-            "pr_open"
-          );
-          console.log(`[Workspace ${workspaceId}] Created contribution with PR ${completedWorkspace.pr_url}`);
-        }
-      }
-    } else {
-      const errorData: WorkspaceError = {
-        type: "container_crashed",
-        message: `OpenCode exited with code ${exitCode}`,
-        details: {
-          logs: "See workspace logs for details",
-        },
-        timestamp: new Date().toISOString(),
-      };
-      db.run(
-        `UPDATE workspaces SET status = 'container_crashed', error_message = ? WHERE id = ?`,
-        JSON.stringify(errorData),
-        workspaceId
-      );
-      console.log(`[Workspace ${workspaceId}] Marked as container_crashed`);
-    }
-
-    // Wait 60 seconds before destroying container (for final log flush)
-    console.log(`[Workspace ${workspaceId}] Waiting 60 seconds before cleanup...`);
-    db.run(
-      `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
-      workspaceId,
-      `[System] Waiting 60 seconds before container cleanup...`
-    );
-    await sleep(60000);
-
-    // Destroy the container
-    console.log(`[Workspace ${workspaceId}] Destroying container ${containerId}...`);
-    try {
-      await runDockerCommand(["stop", containerId]);
-      await runDockerCommand(["rm", "-f", containerId]);
-      db.run(
-        `UPDATE workspaces SET destroyed_at = datetime('now') WHERE id = ?`,
-        workspaceId
-      );
-      db.run(
-        `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
-        workspaceId,
-        `[System] Container destroyed successfully`
-      );
-      console.log(`[Workspace ${workspaceId}] Container destroyed`);
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : "Unknown error";
-      console.error(`[Workspace ${workspaceId}] Failed to destroy container: ${errorMsg}`);
-      db.run(
-        `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stderr')`,
-        workspaceId,
-        `[System] Failed to destroy container: ${errorMsg}`
-      );
+      console.log(`[Workspace ${workspaceId}] Detected PR URL: ${prInfo.prUrl}`);
     }
   });
 
-  // Handle process errors
-  proc.on("error", (err) => {
-    console.error(`[Workspace ${workspaceId}] Process error: ${err.message}`);
+  const { stream: stderrStream, flush: flushStderr } = createLineBufferedStream((line) => {
     db.run(
       `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stderr')`,
       workspaceId,
-      `[System] Process error: ${err.message}`
+      line
+    );
+    console.log(`[Workspace ${workspaceId}] stderr: ${line.slice(0, 100)}...`);
+  });
+
+  // Execute OpenCode in the container using Docker SDK
+  let exitCode = 1;
+  try {
+    const result = await execInContainer({
+      containerId,
+      cmd: ["/home/ubuntu/.opencode/bin/opencode", "run", prompt],
+      stdout: stdoutStream,
+      stderr: stderrStream,
+    });
+    exitCode = result.exitCode;
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : "Unknown error";
+    console.error(`[Workspace ${workspaceId}] Exec error: ${errorMsg}`);
+    db.run(
+      `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stderr')`,
+      workspaceId,
+      `[System] Exec error: ${errorMsg}`
     );
     
     const errorData: WorkspaceError = {
       type: "container_crashed",
-      message: `Failed to execute OpenCode: ${err.message}`,
+      message: `Failed to execute OpenCode: ${errorMsg}`,
       details: {
-        logs: err.message,
+        logs: errorMsg,
       },
       timestamp: new Date().toISOString(),
     };
@@ -303,7 +138,121 @@ Instructions:
       JSON.stringify(errorData),
       workspaceId
     );
-  });
+    return;
+  }
+
+  // Flush any remaining buffered output
+  flushStdout();
+  flushStderr();
+
+  console.log(`[Workspace ${workspaceId}] OpenCode exited with code ${exitCode}`);
+
+  // Log completion
+  db.run(
+    `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
+    workspaceId,
+    `[System] OpenCode execution completed with exit code ${exitCode}`
+  );
+
+  // Update workspace status based on result
+  if (exitCode === 0) {
+    db.run(
+      `UPDATE workspaces SET status = 'completed' WHERE id = ?`,
+      workspaceId
+    );
+    console.log(`[Workspace ${workspaceId}] Marked as completed`);
+
+    // Create or update contribution record if PR was created
+    const completedWorkspace = db.get<Workspace>(
+      `SELECT * FROM workspaces WHERE id = ?`,
+      workspaceId
+    );
+
+    if (completedWorkspace?.pr_url && completedWorkspace.issue_id && completedWorkspace.agent_run_id) {
+      const prNumberMatch = completedWorkspace.pr_url.match(/\/pull\/(\d+)/);
+      const prNumber = prNumberMatch?.[1] ? parseInt(prNumberMatch[1]) : null;
+
+      // Check if contribution already exists for this issue
+      const existingContribution = db.get<{ id: number }>(
+        `SELECT id FROM contributions WHERE issue_id = ?`,
+        completedWorkspace.issue_id
+      );
+
+      if (existingContribution) {
+        // Update existing contribution with PR info
+        db.run(
+          `UPDATE contributions SET pr_url = ?, pr_number = ?, branch_name = ?, status = ?, updated_at = datetime('now') WHERE id = ?`,
+          completedWorkspace.pr_url,
+          prNumber,
+          completedWorkspace.branch_name,
+          "pr_open",
+          existingContribution.id
+        );
+        console.log(`[Workspace ${workspaceId}] Updated contribution ${existingContribution.id} with PR ${completedWorkspace.pr_url}`);
+      } else {
+        // Create new contribution
+        db.run(
+          `INSERT INTO contributions (agent_run_id, issue_id, pr_url, pr_number, branch_name, status) 
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          completedWorkspace.agent_run_id,
+          completedWorkspace.issue_id,
+          completedWorkspace.pr_url,
+          prNumber,
+          completedWorkspace.branch_name,
+          "pr_open"
+        );
+        console.log(`[Workspace ${workspaceId}] Created contribution with PR ${completedWorkspace.pr_url}`);
+      }
+    }
+  } else {
+    const errorData: WorkspaceError = {
+      type: "container_crashed",
+      message: `OpenCode exited with code ${exitCode}`,
+      details: {
+        logs: "See workspace logs for details",
+      },
+      timestamp: new Date().toISOString(),
+    };
+    db.run(
+      `UPDATE workspaces SET status = 'container_crashed', error_message = ? WHERE id = ?`,
+      JSON.stringify(errorData),
+      workspaceId
+    );
+    console.log(`[Workspace ${workspaceId}] Marked as container_crashed`);
+  }
+
+  // Wait 60 seconds before destroying container (for final log flush)
+  console.log(`[Workspace ${workspaceId}] Waiting 60 seconds before cleanup...`);
+  db.run(
+    `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
+    workspaceId,
+    `[System] Waiting 60 seconds before container cleanup...`
+  );
+  await sleep(60000);
+
+  // Destroy the container using Docker SDK
+  console.log(`[Workspace ${workspaceId}] Destroying container ${containerId}...`);
+  try {
+    await stopAndRemoveContainer(containerId);
+    db.run(
+      `UPDATE workspaces SET destroyed_at = datetime('now') WHERE id = ?`,
+      workspaceId
+    );
+    db.run(
+      `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stdout')`,
+      workspaceId,
+      `[System] Container destroyed successfully`
+    );
+    console.log(`[Workspace ${workspaceId}] Container destroyed`);
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : "Unknown error";
+    console.error(`[Workspace ${workspaceId}] Failed to destroy container: ${errorMsg}`);
+    db.run(
+      `INSERT INTO workspace_logs (workspace_id, line, stream) VALUES (?, ?, 'stderr')`,
+      workspaceId,
+      `[System] Failed to destroy container: ${errorMsg}`
+    );
+  }
 }
 
 // Error type for structured error messages
@@ -561,7 +510,7 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
         `INSERT INTO workspaces (agent_id, agent_run_id, repository_id, issue_id, status, branch_name, base_branch, timeout_minutes, expires_at) 
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         body.agent_id,
-        body.agent_run_id,
+        body.agent_run_id ?? null,
         repo.id,
         issue.id,
         "building",
@@ -592,16 +541,16 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
         );
       };
 
-      // 5. Verify Docker is available
-      const dockerCheck = await runDockerCommand(["info"]);
-      if (dockerCheck.exitCode !== 0) {
+      // 5. Verify Docker is available using SDK
+      const dockerAvailable = await checkDockerAvailable();
+      if (!dockerAvailable) {
         setWorkspaceError("build_failed", {
           type: "build_failed",
-          message: `Docker is not available: ${dockerCheck.stderr}`,
+          message: "Docker is not available or not responding",
           details: { attempt: 0 },
           timestamp: new Date().toISOString(),
         });
-        throw new Error(`Docker is not available: ${dockerCheck.stderr}`);
+        throw new Error("Docker is not available or not responding");
       }
 
       // 6. Generate Dockerfile using AI
@@ -619,17 +568,13 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
 Repository: ${repo.full_name}
 URL: ${repo.url}
 Primary Language: ${repoEnv?.primary_language || repo.language || "Unknown"}
-Runtime: ${repoEnv?.runtime || "auto-detect"}
-Package Manager: ${repoEnv?.package_manager || "auto-detect"}
-Setup Commands: ${repoEnv?.setup_commands || "auto-detect from project files"}
-Test Commands: ${repoEnv?.test_commands || "auto-detect from project files"}
 
 ${lastBuildError ? `Previous build attempt failed with error:\n${lastBuildError}\n\nPlease fix the Dockerfile to address this error.\n` : ""}
 
 Requirements:
 1. Start from an appropriate base image for the detected language/runtime:
-   - For Node.js: use node:20-slim
-   - For Python: use python:3.12-slim
+   - For Node.js: use node:20
+   - For Python: use python:3.12
    - For Rust: use rust:latest
    - For Go: use golang:1.22
    - For Java: use eclipse-temurin:21
@@ -664,15 +609,16 @@ Requirements:
 9. Clone the repository:
    RUN git clone ${repo.url}.git /home/ubuntu/repo
 
-10. Change to repo directory and install dependencies:
+10. Set working directory to repo:
     WORKDIR /home/ubuntu/repo
-    ${repoEnv?.setup_commands ? `RUN ${repoEnv.setup_commands}` : "# Dependencies will be installed based on detected project files"}
 
 11. Set PATH to include OpenCode:
     ENV PATH="/home/ubuntu/.opencode/bin:$PATH"
 
 12. Default command:
     CMD ["bash"]
+
+IMPORTANT: Do NOT install project dependencies (no npm install, pip install, etc). Dependencies will be installed at runtime.
 
 Output ONLY the complete Dockerfile content, no explanations or markdown code blocks.`;
 
@@ -716,28 +662,25 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
         throw new Error("Failed to generate Dockerfile");
       }
 
-      // 6. Build Docker image using docker CLI (more reliable for complex builds)
+      // 6. Build Docker image using SDK (creates tar archive in memory)
       const imageName = `uc-workspace-${repo.full_name.replace("/", "-").toLowerCase()}:${Date.now()}`;
-      let buildDir: string | null = null;
+
+      // Accumulate build logs for better error reporting
+      const buildLogs: string[] = [];
+      const MAX_LOG_LINES = 100;
 
       try {
-        // Create temp directory for Dockerfile
-        buildDir = await mkdtemp(join(tmpdir(), "workspace-"));
-        await writeFile(join(buildDir, "Dockerfile"), dockerfile);
-
         console.log(`Building Docker image ${imageName}...`);
         
-        // Build using docker CLI
-        const buildResult = await runDockerCommand([
-          "build",
-          "-t", imageName,
-          "-f", join(buildDir, "Dockerfile"),
-          buildDir,
-        ]);
-
-        if (buildResult.exitCode !== 0) {
-          throw new Error(buildResult.stderr || buildResult.stdout || "Build failed");
-        }
+        // Build using Docker SDK with tar-stream
+        await buildImageFromDockerfile(dockerfile, imageName, (progress) => {
+          console.log(`[Build] ${progress}`);
+          // Keep last N lines for error reporting
+          buildLogs.push(progress);
+          if (buildLogs.length > MAX_LOG_LINES) {
+            buildLogs.shift();
+          }
+        });
 
         console.log("Docker build completed");
 
@@ -745,63 +688,48 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
         const errorMsg = err instanceof Error ? err.message : "Unknown build error";
         console.error("Docker build failed:", errorMsg);
         
+        // Include recent build logs in error details for debugging
+        const recentLogs = buildLogs.slice(-50).join("\n");
+        
         setWorkspaceError("build_failed", {
           type: "build_failed",
           message: `Docker build failed: ${errorMsg}`,
           details: {
             attempt: buildAttempt,
             dockerfile: dockerfile,
-            logs: errorMsg,
+            logs: recentLogs ? `${recentLogs}\n\nError: ${errorMsg}` : errorMsg,
           },
           timestamp: new Date().toISOString(),
         });
         
-        // Cleanup
-        if (buildDir) {
-          await rm(buildDir, { recursive: true }).catch(() => {});
-        }
-        
         throw new Error(`Docker build failed: ${errorMsg}`);
       }
 
-      // Cleanup build directory
-      if (buildDir) {
-        await rm(buildDir, { recursive: true }).catch(() => {});
-      }
-
-      // 7. Create and start container using docker CLI
+      // 7. Create and start container using Docker SDK
       let containerId: string | null = null;
 
       try {
         const containerName = `workspace-${workspace.id}`;
         const homeDir = homedir();
 
-        // Create and run container
-        const runResult = await runDockerCommand([
-          "run",
-          "-d",  // detached
-          "--name", containerName,
-          "-e", `GH_TOKEN=${process.env.GH_TOKEN || ""}`,
-          "-v", `${homeDir}/.ssh/id_ed25519:/home/ubuntu/.ssh/id_ed25519:ro`,
-          "-v", `${homeDir}/.local/share/opencode/auth.json:/home/ubuntu/.local/share/opencode/auth.json:ro`,
-          "-v", `${homeDir}/.config/opencode:/home/ubuntu/.config/opencode:ro`,
-          "--network", "host",
-          "-u", "ubuntu",
-          "-w", "/home/ubuntu/repo",
-          "-t",  // TTY
-          imageName,
-          "tail", "-f", "/dev/null",  // Keep container running
-        ]);
-
-        if (runResult.exitCode !== 0) {
-          throw new Error(runResult.stderr || runResult.stdout || "Container creation failed");
-        }
-
-        containerId = runResult.stdout.trim();
-
-        if (!containerId) {
-          throw new Error("Container created but no ID returned");
-        }
+        // Create and start container using SDK
+        containerId = await createAndStartContainer({
+          image: imageName,
+          name: containerName,
+          cmd: ["tail", "-f", "/dev/null"],  // Keep container running
+          env: {
+            GH_TOKEN: process.env.GH_TOKEN || "",
+          },
+          binds: [
+            `${homeDir}/.ssh/id_ed25519:/home/ubuntu/.ssh/id_ed25519:ro`,
+            `${homeDir}/.local/share/opencode/auth.json:/home/ubuntu/.local/share/opencode/auth.json:ro`,
+            `${homeDir}/.config/opencode:/home/ubuntu/.config/opencode:ro`,
+          ],
+          networkMode: "host",
+          user: "ubuntu",
+          workingDir: "/home/ubuntu/repo",
+          tty: true,
+        });
 
         console.log(`Container ${containerId} started successfully`);
 
@@ -852,7 +780,7 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
       body: t.Object({
         issue_id: t.Number(),
         agent_id: t.Number(),
-        agent_run_id: t.Number(),
+        agent_run_id: t.Optional(t.Number()),
         timeout_minutes: t.Optional(t.Number()),
       }),
     }
@@ -882,9 +810,8 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
       }
 
       try {
-        // Stop and remove the container using docker CLI
-        await runDockerCommand(["stop", workspace.container_id]);
-        await runDockerCommand(["rm", "-f", workspace.container_id]);
+        // Stop and remove the container using Docker SDK
+        await stopAndRemoveContainer(workspace.container_id);
 
         // Update workspace status
         db.run(

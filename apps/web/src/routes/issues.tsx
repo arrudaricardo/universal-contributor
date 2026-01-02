@@ -158,7 +158,6 @@ const spawnWorkspaceApi = async (issueId: number, agentId: number): Promise<Work
   const { data, error } = await api.workspaces.spawn.post({
     issue_id: issueId,
     agent_id: agentId,
-    agent_run_id: agentId,
   })
   if (error) throw new Error(String(error))
   return data as Workspace
@@ -506,6 +505,44 @@ function IssuesPage() {
     addIssueMutation.mutate(issueUrl)
   }
 
+  // Resume Fix Dialog Handler - opens the modal for an issue already being fixed
+  const handleResumeFixDialog = async (issue: Issue) => {
+    setFixingIssue(issue)
+    setFixDialogOpen(true)
+    setFixError(null)
+    setContribution(null)
+    setWorkspaceLogs([])
+    setLastLogId(0)
+
+    try {
+      // Fetch existing workspaces for this issue
+      const workspaces = await getWorkspacesByIssueApi(issue.id)
+      if (workspaces.length > 0) {
+        // Get the most recent workspace (first in the list)
+        const workspace = workspaces[0]
+        setActiveWorkspace(workspace)
+
+        // Fetch existing logs for this workspace
+        const logs = await getWorkspaceLogsApi(workspace.id)
+        if (logs.length > 0) {
+          setWorkspaceLogs(logs)
+          setLastLogId(logs[logs.length - 1].id)
+        }
+
+        // Check for existing contribution if completed
+        if (workspace.status === 'completed') {
+          const contributions = await getContributionsByIssueApi(issue.id)
+          if (contributions.length > 0) {
+            setContribution(contributions[0])
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Failed to resume fix dialog:', err)
+      setFixError(err instanceof Error ? err.message : 'Failed to load workspace status')
+    }
+  }
+
   // Fix with AI Handler
   const handleFixWithAI = async (issue: Issue) => {
     setFixingIssue(issue)
@@ -650,7 +687,6 @@ function IssuesPage() {
     return (
       issue.status === 'pending' ||
       issue.status === 'extracting' ||
-      issue.status === 'fixing' ||
       !issue.ai_fix_prompt
     )
   }
@@ -865,6 +901,27 @@ function IssuesPage() {
                   {cancelWorkspaceMutation.isPending ? 'Cancelling...' : 'Cancel'}
                 </Button>
               )}
+              {(fixError ||
+                activeWorkspace?.status === 'build_failed' ||
+                activeWorkspace?.status === 'container_crashed' ||
+                activeWorkspace?.status === 'timeout') && (
+                <Button
+                  onClick={() => {
+                    if (fixingIssue) {
+                      // Reset state and retry
+                      setActiveWorkspace(null)
+                      setFixError(null)
+                      setWorkspaceLogs([])
+                      setLastLogId(0)
+                      setContribution(null)
+                      handleFixWithAI(fixingIssue)
+                    }
+                  }}
+                >
+                  <RefreshCwIcon className="mr-2 size-4" />
+                  Retry
+                </Button>
+              )}
               <Button variant="outline" onClick={() => setFixDialogOpen(false)}>
                 {activeWorkspace?.status === 'completed' ||
                 activeWorkspace?.status === 'build_failed' ||
@@ -1049,7 +1106,7 @@ function IssuesPage() {
                       )}
                       {shouldShowFixButton(issue) && (
                         <Button
-                          onClick={() => handleFixWithAI(issue)}
+                          onClick={() => issue.status === 'fixing' ? handleResumeFixDialog(issue) : handleFixWithAI(issue)}
                           disabled={isFixButtonDisabled(issue)}
                           title={
                             !issue.ai_fix_prompt
@@ -1100,7 +1157,7 @@ function IssuesPage() {
                       </div>
                     )}
                     {issue.status === 'error' && issue.ai_analysis && (
-                      <p className="text-destructive text-sm mt-2">Error: {issue.ai_analysis}</p>
+                      <p className="text-destructive text-sm mt-2 wrap-anywhere">Error: {issue.ai_analysis}</p>
                     )}
                   </CardContent>
                 )}

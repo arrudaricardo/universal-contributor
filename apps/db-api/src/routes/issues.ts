@@ -79,6 +79,10 @@ async function extractIssueData(
         language: { type: ["string", "null"], description: "Primary programming language" },
         defaultBranch: { type: "string", description: "The default branch name" },
         hasPackageJson: { type: "boolean", description: "true if package.json exists in the root" },
+        hasPackageLockJson: { type: "boolean", description: "true if package-lock.json exists in the root" },
+        hasYarnLock: { type: "boolean", description: "true if yarn.lock exists in the root" },
+        hasPnpmLock: { type: "boolean", description: "true if pnpm-lock.yaml exists in the root" },
+        hasBunLock: { type: "boolean", description: "true if bun.lockb or bun.lock exists in the root" },
         hasRequirementsTxt: { type: "boolean", description: "true if requirements.txt exists in the root" },
         hasPyprojectToml: { type: "boolean", description: "true if pyproject.toml exists in the root" },
         hasCargoToml: { type: "boolean", description: "true if Cargo.toml exists in the root" },
@@ -89,7 +93,7 @@ async function extractIssueData(
         hasDockerfile: { type: "boolean", description: "true if Dockerfile exists in the root" },
         readmeSetupInstructions: { type: ["string", "null"], description: "Setup/installation instructions from README (max 500 chars)" },
       },
-      required: ["description", "stars", "forks", "language", "defaultBranch", "hasPackageJson", "hasRequirementsTxt", "hasPyprojectToml", "hasCargoToml", "hasGoMod", "hasPomXml", "hasGradleBuild", "hasMakefile", "hasDockerfile", "readmeSetupInstructions"],
+      required: ["description", "stars", "forks", "language", "defaultBranch", "hasPackageJson", "hasPackageLockJson", "hasYarnLock", "hasPnpmLock", "hasBunLock", "hasRequirementsTxt", "hasPyprojectToml", "hasCargoToml", "hasGoMod", "hasPomXml", "hasGradleBuild", "hasMakefile", "hasDockerfile", "readmeSetupInstructions"],
     };
 
     // Extract issue data using Firecrawl
@@ -136,6 +140,10 @@ async function extractIssueData(
 
             Look at the file tree in the repository root and determine:
             - hasPackageJson: true if package.json exists in the root
+            - hasPackageLockJson: true if package-lock.json exists in the root
+            - hasYarnLock: true if yarn.lock exists in the root
+            - hasPnpmLock: true if pnpm-lock.yaml exists in the root
+            - hasBunLock: true if bun.lockb or bun.lock exists in the root
             - hasRequirementsTxt: true if requirements.txt exists in the root
             - hasPyprojectToml: true if pyproject.toml exists in the root
             - hasCargoToml: true if Cargo.toml exists in the root
@@ -159,6 +167,10 @@ async function extractIssueData(
         language: string | null;
         defaultBranch: string;
         hasPackageJson: boolean;
+        hasPackageLockJson: boolean;
+        hasYarnLock: boolean;
+        hasPnpmLock: boolean;
+        hasBunLock: boolean;
         hasRequirementsTxt: boolean;
         hasPyprojectToml: boolean;
         hasCargoToml: boolean;
@@ -201,46 +213,37 @@ async function extractIssueData(
     const repoEnvData = repoResult.parsed;
     if (repoEnvData) {
       // Determine runtime and package manager based on detected files
+      // Note: We only detect the package manager for reference, dependencies are installed at runtime by OpenCode
       let runtime: string | null = null;
       let packageManager: string | null = null;
-      let setupCommands: string | null = null;
-      let testCommands: string | null = null;
 
       if (repoEnvData.hasPackageJson) {
         runtime = "node";
-        packageManager = "npm";
-        setupCommands = "npm install";
-        testCommands = "npm test";
-      } else if (repoEnvData.hasRequirementsTxt) {
+        // Detect package manager from lock files
+        if (repoEnvData.hasBunLock) {
+          packageManager = "bun";
+        } else if (repoEnvData.hasPnpmLock) {
+          packageManager = "pnpm";
+        } else if (repoEnvData.hasYarnLock) {
+          packageManager = "yarn";
+        } else {
+          packageManager = "npm";
+        }
+      } else if (repoEnvData.hasRequirementsTxt || repoEnvData.hasPyprojectToml) {
         runtime = "python";
-        packageManager = "pip";
-        setupCommands = "pip install -r requirements.txt";
-        testCommands = "pytest";
-      } else if (repoEnvData.hasPyprojectToml) {
-        runtime = "python";
-        packageManager = "poetry";
-        setupCommands = "poetry install";
-        testCommands = "poetry run pytest";
+        packageManager = repoEnvData.hasPyprojectToml ? "poetry" : "pip";
       } else if (repoEnvData.hasCargoToml) {
         runtime = "rust";
         packageManager = "cargo";
-        setupCommands = "cargo build";
-        testCommands = "cargo test";
       } else if (repoEnvData.hasGoMod) {
         runtime = "go";
         packageManager = "go";
-        setupCommands = "go mod download";
-        testCommands = "go test ./...";
       } else if (repoEnvData.hasPomXml) {
         runtime = "java";
         packageManager = "maven";
-        setupCommands = "mvn install";
-        testCommands = "mvn test";
       } else if (repoEnvData.hasGradleBuild) {
         runtime = "java";
         packageManager = "gradle";
-        setupCommands = "./gradlew build";
-        testCommands = "./gradlew test";
       }
 
       // Check if environment record exists
@@ -253,26 +256,22 @@ async function extractIssueData(
         db.run(
           `UPDATE repository_environments SET
             primary_language = ?, runtime = ?, package_manager = ?,
-            setup_commands = ?, test_commands = ?, last_updated_at = datetime('now')
+            setup_commands = NULL, test_commands = NULL, last_updated_at = datetime('now')
            WHERE repository_id = ?`,
           repoEnvData.language,
           runtime,
           packageManager,
-          setupCommands,
-          testCommands,
           repo.id
         );
       } else {
         db.run(
           `INSERT INTO repository_environments
-            (repository_id, primary_language, runtime, package_manager, setup_commands, test_commands)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+            (repository_id, primary_language, runtime, package_manager)
+           VALUES (?, ?, ?, ?)`,
           repo.id,
           repoEnvData.language,
           runtime,
-          packageManager,
-          setupCommands,
-          testCommands
+          packageManager
         );
       }
     }

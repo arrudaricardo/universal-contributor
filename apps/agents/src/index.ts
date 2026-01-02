@@ -1,4 +1,8 @@
-import { spawn } from "child_process";
+import { Writable } from "stream";
+import {
+  execInContainer,
+  closeDockerClient,
+} from "@universal-contributor/shared/docker";
 
 // Configuration
 const DB_API_URL = process.env.DB_API_URL ?? "http://localhost:3002";
@@ -65,43 +69,53 @@ async function apiRequest<T>(
   }
 }
 
-// Run a command and return output
-async function runCommand(
-  command: string,
-  args: string[]
+// Run a command in a container and return output using Docker SDK
+async function runCommandInContainer(
+  containerId: string,
+  cmd: string[]
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  return new Promise((resolve) => {
-    const proc = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
+  let stdout = "";
+  let stderr = "";
 
-    proc.stdout?.on("data", (data) => {
-      const chunk = data.toString();
-      stdout += chunk;
-      process.stdout.write(chunk); // Stream output to console
-    });
-
-    proc.stderr?.on("data", (data) => {
-      const chunk = data.toString();
-      stderr += chunk;
-      process.stderr.write(chunk); // Stream output to console
-    });
-
-    proc.on("close", (exitCode) => {
-      resolve({ stdout, stderr, exitCode: exitCode ?? 1 });
-    });
-
-    proc.on("error", (err) => {
-      resolve({ stdout, stderr: err.message, exitCode: 1 });
-    });
+  // Create streams that capture output and stream to console
+  const stdoutStream = new Writable({
+    write(chunk, _encoding, callback) {
+      const data = chunk.toString();
+      stdout += data;
+      process.stdout.write(data); // Stream output to console
+      callback();
+    },
   });
+
+  const stderrStream = new Writable({
+    write(chunk, _encoding, callback) {
+      const data = chunk.toString();
+      stderr += data;
+      process.stderr.write(data); // Stream output to console
+      callback();
+    },
+  });
+
+  try {
+    const result = await execInContainer({
+      containerId,
+      cmd,
+      stdout: stdoutStream,
+      stderr: stderrStream,
+    });
+
+    return { stdout, stderr, exitCode: result.exitCode };
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : "Unknown error";
+    return { stdout, stderr: errorMsg, exitCode: 1 };
+  }
 }
 
 // Get or create agent
 async function getOrCreateAgent(): Promise<Agent | null> {
   // Try to find existing agent
   const { data: agents } = await apiRequest<Agent[]>("/agents");
-  
+
   if (agents && agents.length > 0) {
     const existingAgent = agents.find((a) => a.name === AGENT_NAME);
     if (existingAgent) {
@@ -188,9 +202,7 @@ Instructions:
   console.log(`Prompt:\n${prompt.slice(0, 500)}${prompt.length > 500 ? "..." : ""}\n`);
 
   const startTime = Date.now();
-  const result = await runCommand("docker", [
-    "exec",
-    workspace.container_id,
+  const result = await runCommandInContainer(workspace.container_id, [
     "/home/ubuntu/.opencode/bin/opencode",
     "run",
     "--attach",
@@ -326,11 +338,13 @@ async function main() {
 // Handle graceful shutdown
 process.on("SIGINT", async () => {
   console.log("\nReceived SIGINT, shutting down...");
+  await closeDockerClient();
   process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
   console.log("\nReceived SIGTERM, shutting down...");
+  await closeDockerClient();
   process.exit(0);
 });
 
