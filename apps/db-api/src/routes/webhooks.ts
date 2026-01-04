@@ -1,5 +1,46 @@
 import { Elysia, t } from "elysia";
+import { createHmac, timingSafeEqual } from "crypto";
 import { dbPlugin } from "../db-plugin";
+
+// GitHub webhook payload types
+interface GitHubPullRequest {
+  number: number;
+  html_url: string;
+  merged: boolean;
+  state: string;
+}
+
+interface GitHubPullRequestPayload {
+  action: string;
+  pull_request: GitHubPullRequest;
+  repository: {
+    full_name: string;
+  };
+}
+
+interface Contribution {
+  id: number;
+  issue_id: number;
+  pr_url: string | null;
+  pr_number: number | null;
+  status: string;
+}
+
+// Verify GitHub webhook signature
+function verifyGitHubSignature(
+  payload: string,
+  signature: string | undefined,
+  secret: string
+): boolean {
+  if (!signature) return false;
+  try {
+    const expected =
+      "sha256=" + createHmac("sha256", secret).update(payload).digest("hex");
+    return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
 
 export interface Webhook {
   id: number;
@@ -138,4 +179,93 @@ export const webhooksRoutes = new Elysia({ prefix: "/webhooks" })
       `SELECT * FROM webhooks WHERE id = ?`,
       parseInt(params.id)
     );
-  });
+  })
+  .post(
+    "/github",
+    async ({ db, request, set }) => {
+      const secret = process.env.GITHUB_WEBHOOK_SECRET;
+      if (!secret) {
+        console.error("[Webhook] GITHUB_WEBHOOK_SECRET not configured");
+        set.status = 500;
+        return { error: "Webhook secret not configured" };
+      }
+
+      // Get raw body for signature verification
+      const rawBody = await request.text();
+
+      // Verify signature
+      const signature = request.headers.get("x-hub-signature-256");
+      if (!verifyGitHubSignature(rawBody, signature ?? undefined, secret)) {
+        console.error("[Webhook] Invalid signature");
+        set.status = 401;
+        return { error: "Invalid signature" };
+      }
+
+      // Parse payload
+      let payload: GitHubPullRequestPayload;
+      try {
+        payload = JSON.parse(rawBody);
+      } catch {
+        console.error("[Webhook] Invalid JSON payload");
+        set.status = 400;
+        return { error: "Invalid JSON payload" };
+      }
+
+      // Get event type
+      const eventType = request.headers.get("x-github-event");
+      console.log(`[Webhook] Received ${eventType} event, action: ${payload.action}`);
+
+      // Store webhook for auditing
+      db.run(
+        `INSERT INTO webhooks (event_type, payload, action) VALUES (?, ?, ?)`,
+        eventType,
+        rawBody,
+        payload.action ?? null
+      );
+
+      // Handle pull_request events
+      if (eventType === "pull_request") {
+        const prNumber = payload.pull_request.number;
+        const prUrl = payload.pull_request.html_url;
+        const action = payload.action;
+        const merged = payload.pull_request.merged;
+
+        console.log(`[Webhook] PR #${prNumber} - action: ${action}, merged: ${merged}`);
+
+        // Find contribution by PR URL or PR number
+        const contribution = db.get<Contribution>(
+          `SELECT * FROM contributions WHERE pr_url = ? OR pr_number = ?`,
+          prUrl,
+          prNumber
+        );
+
+        if (contribution) {
+          console.log(`[Webhook] Found contribution ${contribution.id} for PR #${prNumber}`);
+
+          if (action === "closed" && merged) {
+            // PR was merged - update issue status to 'fixed' and contribution status to 'merged'
+            db.run(
+              `UPDATE issues SET status = 'fixed' WHERE id = ?`,
+              contribution.issue_id
+            );
+            db.run(
+              `UPDATE contributions SET status = 'merged', updated_at = datetime('now') WHERE id = ?`,
+              contribution.id
+            );
+            console.log(`[Webhook] Issue ${contribution.issue_id} marked as fixed (PR merged)`);
+          } else if (action === "closed" && !merged) {
+            // PR was closed without merging
+            db.run(
+              `UPDATE contributions SET status = 'closed', updated_at = datetime('now') WHERE id = ?`,
+              contribution.id
+            );
+            console.log(`[Webhook] Contribution ${contribution.id} marked as closed (PR closed without merge)`);
+          }
+        } else {
+          console.log(`[Webhook] No contribution found for PR #${prNumber} (${prUrl})`);
+        }
+      }
+
+      return { received: true };
+    }
+  );

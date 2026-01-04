@@ -235,6 +235,10 @@ function IssuesPage() {
   const [logsLoading, setLogsLoading] = useState(false)
   const historicalLogsContainerRef = useRef<HTMLDivElement>(null)
 
+  // Re-run Fix Confirmation Dialog State
+  const [rerunDialogOpen, setRerunDialogOpen] = useState(false)
+  const [issueToRerun, setIssueToRerun] = useState<Issue | null>(null)
+
   // Fetch issues with auto-refresh for active states
   const { data: issues, isLoading } = useQuery<Issue[]>({
     queryKey: ['issues'],
@@ -249,6 +253,29 @@ function IssuesPage() {
       )
       return hasActiveIssue || extractingIds.size > 0 ? 3000 : false
     },
+  })
+
+  // Fetch contributions for fixed and pr_open issues to display PR links
+  const prIssueIds = issues?.filter((issue) => issue.status === 'fixed' || issue.status === 'pr_open').map((issue) => issue.id) || []
+  const { data: issueContributions } = useQuery({
+    queryKey: ['contributions-for-issues', prIssueIds],
+    queryFn: async () => {
+      const results = await Promise.all(
+        prIssueIds.map(async (issueId) => {
+          const contributions = await getContributionsByIssueApi(issueId)
+          return { issueId, contribution: contributions[0] || null }
+        })
+      )
+      // Create a map of issue_id -> contribution
+      const map = new Map<number, Contribution>()
+      results.forEach(({ issueId, contribution }) => {
+        if (contribution) {
+          map.set(issueId, contribution)
+        }
+      })
+      return map
+    },
+    enabled: prIssueIds.length > 0,
   })
 
   // Poll workspace status while fix dialog is open
@@ -581,6 +608,7 @@ function IssuesPage() {
         return 'secondary'
       case 'open':
       case 'extracted':
+      case 'pr_open':
         return 'default'
       case 'fixed':
         return 'outline'
@@ -659,6 +687,9 @@ function IssuesPage() {
       return 'pending'
     }
 
+    // When completed, all steps should be marked as done
+    if (status === 'completed') return 'done'
+
     if (stepIndex < currentIndex) return 'done'
     if (stepIndex === currentIndex) return 'active'
     return 'pending'
@@ -687,6 +718,7 @@ function IssuesPage() {
     return (
       issue.status === 'pending' ||
       issue.status === 'extracting' ||
+      issue.status === 'fixing' ||
       !issue.ai_fix_prompt
     )
   }
@@ -1032,6 +1064,35 @@ function IssuesPage() {
           </DialogContent>
         </Dialog>
 
+        {/* Re-run Fix Confirmation Dialog */}
+        <Dialog open={rerunDialogOpen} onOpenChange={setRerunDialogOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Re-run Fix</DialogTitle>
+              <DialogDescription>
+                This will push new changes to the existing PR for issue #{issueToRerun?.github_issue_number}. 
+                The AI will attempt to address any feedback or make improvements to the existing fix.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setRerunDialogOpen(false)}>
+                Cancel
+              </Button>
+              <Button
+                onClick={() => {
+                  if (issueToRerun) {
+                    handleFixWithAI(issueToRerun)
+                    setRerunDialogOpen(false)
+                    setIssueToRerun(null)
+                  }
+                }}
+              >
+                Continue
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         {/* Issues List */}
         {isLoading ? (
           <div className="flex items-center justify-center py-12">
@@ -1106,7 +1167,16 @@ function IssuesPage() {
                       )}
                       {shouldShowFixButton(issue) && (
                         <Button
-                          onClick={() => issue.status === 'fixing' ? handleResumeFixDialog(issue) : handleFixWithAI(issue)}
+                          onClick={() => {
+                            if (issue.status === 'fixing') {
+                              handleResumeFixDialog(issue)
+                            } else if (issue.status === 'pr_open') {
+                              setIssueToRerun(issue)
+                              setRerunDialogOpen(true)
+                            } else {
+                              handleFixWithAI(issue)
+                            }
+                          }}
                           disabled={isFixButtonDisabled(issue)}
                           title={
                             !issue.ai_fix_prompt
@@ -1119,6 +1189,8 @@ function IssuesPage() {
                               <Spinner className="mr-2 size-4" />
                               Fixing...
                             </>
+                          ) : issue.status === 'pr_open' ? (
+                            'Re-run Fix'
                           ) : (
                             'Fix with AI'
                           )}
@@ -1145,7 +1217,8 @@ function IssuesPage() {
                   </div>
                 </CardHeader>
                 {(parseLabels(issue.labels).length > 0 ||
-                  (issue.status === 'error' && issue.ai_analysis)) && (
+                  (issue.status === 'error' && issue.ai_analysis) ||
+                  ((issue.status === 'fixed' || issue.status === 'pr_open') && issueContributions?.get(issue.id))) && (
                   <CardContent className="pt-0">
                     {parseLabels(issue.labels).length > 0 && (
                       <div className="flex flex-wrap gap-1">
@@ -1158,6 +1231,18 @@ function IssuesPage() {
                     )}
                     {issue.status === 'error' && issue.ai_analysis && (
                       <p className="text-destructive text-sm mt-2 wrap-anywhere">Error: {issue.ai_analysis}</p>
+                    )}
+                    {(issue.status === 'fixed' || issue.status === 'pr_open') && issueContributions?.get(issue.id)?.pr_url && (
+                      <a
+                        href={issueContributions.get(issue.id)!.pr_url!}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-sm text-green-600 hover:underline mt-2"
+                      >
+                        <GitPullRequestIcon className="size-4" />
+                        View Pull Request #{issueContributions.get(issue.id)!.pr_number}
+                        <ExternalLinkIcon className="size-3" />
+                      </a>
                     )}
                   </CardContent>
                 )}

@@ -36,6 +36,8 @@ interface IssueForExecution {
   title: string;
   body: string | null;
   ai_fix_prompt: string | null;
+  existing_branch_name: string | null;
+  existing_pr_url: string | null;
 }
 
 // Database interface for background execution
@@ -52,9 +54,34 @@ async function executeOpenCodeInBackground(
   issue: IssueForExecution
 ): Promise<void> {
   // Build the prompt from the issue
-  const prompt =
-    issue.ai_fix_prompt ||
-    `Fix GitHub issue #${issue.github_issue_number}: ${issue.title}
+  const isRerun = !!issue.existing_branch_name;
+  
+  let prompt: string;
+  if (isRerun) {
+    // Re-run: checkout existing branch and push updates
+    prompt =
+      issue.ai_fix_prompt ||
+      `Fix GitHub issue #${issue.github_issue_number}: ${issue.title}
+
+${issue.body || "No description provided"}
+
+IMPORTANT: This is a RE-RUN of a previous fix attempt. A PR already exists.
+- Existing branch: ${issue.existing_branch_name}
+- Existing PR: ${issue.existing_pr_url || "unknown"}
+
+Instructions:
+1. Checkout the existing branch '${issue.existing_branch_name}' (it should already exist on the remote)
+2. Review any feedback or comments on the existing PR
+3. Make additional changes to address the feedback or improve the fix
+4. Run tests to verify the fix works
+5. Commit your changes with a descriptive message
+6. Push the changes to the existing branch (this will update the PR automatically)
+7. Do NOT create a new pull request - just push to the existing branch`;
+  } else {
+    // First run: create new branch and PR
+    prompt =
+      issue.ai_fix_prompt ||
+      `Fix GitHub issue #${issue.github_issue_number}: ${issue.title}
 
 ${issue.body || "No description provided"}
 
@@ -66,6 +93,7 @@ Instructions:
 5. Create a git branch named 'fix/issue-${issue.github_issue_number}'
 6. Commit your changes with a descriptive message
 7. Push the branch and create a pull request`;
+  }
 
   console.log(`[Workspace ${workspaceId}] Starting OpenCode execution...`);
   
@@ -203,6 +231,13 @@ Instructions:
         );
         console.log(`[Workspace ${workspaceId}] Created contribution with PR ${completedWorkspace.pr_url}`);
       }
+
+      // Update issue status to 'pr_open'
+      db.run(
+        `UPDATE issues SET status = 'pr_open' WHERE id = ?`,
+        completedWorkspace.issue_id
+      );
+      console.log(`[Workspace ${workspaceId}] Updated issue ${completedWorkspace.issue_id} status to pr_open`);
     }
   } else {
     const errorData: WorkspaceError = {
@@ -501,10 +536,25 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
         repo.id
       );
 
+      // 3.5. Check for existing contribution with branch (for re-runs)
+      const existingContribution = db.get<{
+        branch_name: string | null;
+        pr_url: string | null;
+      }>(
+        `SELECT branch_name, pr_url FROM contributions WHERE issue_id = ? AND branch_name IS NOT NULL ORDER BY id DESC LIMIT 1`,
+        issue.id
+      );
+      const existingBranchName = existingContribution?.branch_name || null;
+      const existingPrUrl = existingContribution?.pr_url || null;
+      
+      if (existingBranchName) {
+        console.log(`[Spawn] Re-run detected - reusing existing branch: ${existingBranchName}`);
+      }
+
       // 4. Create initial workspace record
       const timeoutMinutes = body.timeout_minutes ?? 60;
       const expiresAt = new Date(Date.now() + timeoutMinutes * 60 * 1000).toISOString();
-      const branchName = `fix/issue-${issue.github_issue_number}`;
+      const branchName = existingBranchName || `fix/issue-${issue.github_issue_number}`;
 
       db.run(
         `INSERT INTO workspaces (agent_id, agent_run_id, repository_id, issue_id, status, branch_name, base_branch, timeout_minutes, expires_at) 
@@ -750,6 +800,8 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
           title: issue.title,
           body: issue.body,
           ai_fix_prompt: issue.ai_fix_prompt,
+          existing_branch_name: existingBranchName,
+          existing_pr_url: existingPrUrl,
         });
 
         console.log(`[Workspace ${workspace.id}] OpenCode execution started in background`);
