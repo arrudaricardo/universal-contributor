@@ -43,7 +43,9 @@ class Database {
         source TEXT NOT NULL,
         trending_rank INTEGER,
         discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
-        last_checked_at TEXT
+        last_checked_at TEXT,
+        fork_full_name TEXT,
+        fork_url TEXT
       )
     `);
 

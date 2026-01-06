@@ -202,12 +202,32 @@ Instructions:
   console.log(`Prompt:\n${prompt.slice(0, 500)}${prompt.length > 500 ? "..." : ""}\n`);
 
   const startTime = Date.now();
+
+  // Base64 encode the prompt to safely pass it to the container
+  // This avoids issues with newlines, quotes, and special characters
+  const promptBase64 = Buffer.from(prompt).toString("base64");
+
+  // Write the prompt to a temp file inside the container
+  const writeResult = await runCommandInContainer(workspace.container_id, [
+    "bash",
+    "-c",
+    `echo "${promptBase64}" | base64 -d > /tmp/prompt.txt`,
+  ]);
+
+  if (writeResult.exitCode !== 0) {
+    console.error("Failed to write prompt file to container:", writeResult.stderr);
+    return false;
+  }
+
+  // Run OpenCode with the prompt file attached
   const result = await runCommandInContainer(workspace.container_id, [
     "/home/ubuntu/.opencode/bin/opencode",
     "run",
     "--attach",
     OPENCODE_URL,
-    prompt,
+    "-f",
+    "/tmp/prompt.txt",
+    "Fix the issue described in the attached file",
   ]);
   const duration = Math.round((Date.now() - startTime) / 1000);
 

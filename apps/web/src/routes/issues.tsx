@@ -255,8 +255,8 @@ function IssuesPage() {
     },
   })
 
-  // Fetch contributions for fixed and pr_open issues to display PR links
-  const prIssueIds = issues?.filter((issue) => issue.status === 'fixed' || issue.status === 'pr_open').map((issue) => issue.id) || []
+  // Fetch contributions for fixed, pr_open, and fixing issues (in case status wasn't updated)
+  const prIssueIds = issues?.filter((issue) => issue.status === 'fixed' || issue.status === 'pr_open' || issue.status === 'fixing').map((issue) => issue.id) || []
   const { data: issueContributions } = useQuery({
     queryKey: ['contributions-for-issues', prIssueIds],
     queryFn: async () => {
@@ -378,8 +378,15 @@ function IssuesPage() {
     if (workspaceStatus) {
       setActiveWorkspace(workspaceStatus)
 
-      // When completed, fetch contribution for PR URL
-      if (workspaceStatus.status === 'completed' && fixingIssue) {
+      // When completed (or terminal state), fetch contribution for PR URL and refresh issues
+      const isTerminalState = workspaceStatus.status === 'completed' ||
+        workspaceStatus.status === 'build_failed' ||
+        workspaceStatus.status === 'container_crashed' ||
+        workspaceStatus.status === 'timeout' ||
+        workspaceStatus.status === 'destroyed'
+
+      if (isTerminalState && fixingIssue) {
+        // Fetch contribution for PR URL (may have been created even without detected PR)
         getContributionsByIssueApi(fixingIssue.id)
           .then((contributions) => {
             if (contributions.length > 0) {
@@ -388,8 +395,10 @@ function IssuesPage() {
           })
           .catch(console.error)
 
-        // Refresh issues list
+        // Refresh issues list to get updated status
         queryClient.invalidateQueries({ queryKey: ['issues'] })
+        // Also refresh contributions for the issues list display
+        queryClient.invalidateQueries({ queryKey: ['contributions-for-issues'] })
       }
     }
   }, [workspaceStatus, fixingIssue, queryClient])
@@ -718,7 +727,6 @@ function IssuesPage() {
     return (
       issue.status === 'pending' ||
       issue.status === 'extracting' ||
-      issue.status === 'fixing' ||
       !issue.ai_fix_prompt
     )
   }
@@ -854,7 +862,7 @@ function IssuesPage() {
                   <span className="text-sm font-medium">Logs:</span>
                   <div
                     ref={logsContainerRef}
-                    className="rounded-md bg-muted/50 p-3 max-h-60 overflow-auto font-mono text-xs"
+                    className="rounded-md bg-muted/50 p-3 max-h-60 overflow-auto font-mono text-xs wrap-anywhere"
                   >
                     {workspaceLogs.map((log) => (
                       <div
@@ -896,7 +904,7 @@ function IssuesPage() {
                       Branch: <code className="bg-green-500/10 px-1 rounded">{activeWorkspace.branch_name}</code>
                     </p>
                   )}
-                  {contribution?.pr_url && (
+                  {contribution?.pr_url ? (
                     <a
                       href={contribution.pr_url}
                       target="_blank"
@@ -907,6 +915,10 @@ function IssuesPage() {
                       View Pull Request #{contribution.pr_number}
                       <ExternalLinkIcon className="size-3" />
                     </a>
+                  ) : (
+                    <p className="text-xs text-green-600/80">
+                      PR link not detected. Check the repository for the pull request.
+                    </p>
                   )}
                 </div>
               )}
@@ -1070,7 +1082,7 @@ function IssuesPage() {
             <DialogHeader>
               <DialogTitle>Re-run Fix</DialogTitle>
               <DialogDescription>
-                This will push new changes to the existing PR for issue #{issueToRerun?.github_issue_number}. 
+                This will push new changes to the existing PR for issue #{issueToRerun?.github_issue_number}.
                 The AI will attempt to address any feedback or make improvements to the existing fix.
               </DialogDescription>
             </DialogHeader>
@@ -1218,7 +1230,7 @@ function IssuesPage() {
                 </CardHeader>
                 {(parseLabels(issue.labels).length > 0 ||
                   (issue.status === 'error' && issue.ai_analysis) ||
-                  ((issue.status === 'fixed' || issue.status === 'pr_open') && issueContributions?.get(issue.id))) && (
+                  issueContributions?.get(issue.id)?.pr_url) && (
                   <CardContent className="pt-0">
                     {parseLabels(issue.labels).length > 0 && (
                       <div className="flex flex-wrap gap-1">
@@ -1232,7 +1244,7 @@ function IssuesPage() {
                     {issue.status === 'error' && issue.ai_analysis && (
                       <p className="text-destructive text-sm mt-2 wrap-anywhere">Error: {issue.ai_analysis}</p>
                     )}
-                    {(issue.status === 'fixed' || issue.status === 'pr_open') && issueContributions?.get(issue.id)?.pr_url && (
+                    {issueContributions?.get(issue.id)?.pr_url && (
                       <a
                         href={issueContributions.get(issue.id)!.pr_url!}
                         target="_blank"

@@ -38,6 +38,9 @@ interface IssueForExecution {
   ai_fix_prompt: string | null;
   existing_branch_name: string | null;
   existing_pr_url: string | null;
+  // Fork info for PR creation
+  original_repo_full_name: string;
+  fork_full_name: string;
 }
 
 // Database interface for background execution
@@ -55,6 +58,7 @@ async function executeOpenCodeInBackground(
 ): Promise<void> {
   // Build the prompt from the issue
   const isRerun = !!issue.existing_branch_name;
+  const forkOwner = issue.fork_full_name.split("/")[0];
   
   let prompt: string;
   if (isRerun) {
@@ -68,31 +72,43 @@ ${issue.body || "No description provided"}
 IMPORTANT: This is a RE-RUN of a previous fix attempt. A PR already exists.
 - Existing branch: ${issue.existing_branch_name}
 - Existing PR: ${issue.existing_pr_url || "unknown"}
+- Original repository: ${issue.original_repo_full_name}
+- Your fork: ${issue.fork_full_name}
 
 Instructions:
-1. Checkout the existing branch '${issue.existing_branch_name}' (it should already exist on the remote)
-2. Review any feedback or comments on the existing PR
-3. Make additional changes to address the feedback or improve the fix
-4. Run tests to verify the fix works
-5. Commit your changes with a descriptive message
-6. Push the changes to the existing branch (this will update the PR automatically)
-7. Do NOT create a new pull request - just push to the existing branch`;
+1. Sync with upstream first: git fetch upstream && git rebase upstream/main
+2. Checkout the existing branch '${issue.existing_branch_name}' (it should already exist on the remote)
+3. Review any feedback or comments on the existing PR
+4. Make additional changes to address the feedback or improve the fix
+5. Run tests to verify the fix works
+6. Commit your changes with a descriptive message
+7. Push the changes to origin (your fork) - this will update the PR automatically
+8. Do NOT create a new pull request - just push to the existing branch`;
   } else {
-    // First run: create new branch and PR
+    // First run: create new branch and PR from fork
     prompt =
       issue.ai_fix_prompt ||
       `Fix GitHub issue #${issue.github_issue_number}: ${issue.title}
 
 ${issue.body || "No description provided"}
 
+IMPORTANT SETUP INFO:
+- Original repository: ${issue.original_repo_full_name}
+- Your fork: ${issue.fork_full_name}
+- The 'origin' remote points to YOUR FORK
+- The 'upstream' remote points to the ORIGINAL repository
+
 Instructions:
-1. Analyze the issue and understand what needs to be fixed
-2. Find the relevant code in the repository
-3. Make the necessary changes to fix the issue
-4. Run tests to verify the fix works
-5. Create a git branch named 'fix/issue-${issue.github_issue_number}'
-6. Commit your changes with a descriptive message
-7. Push the branch and create a pull request`;
+1. First, sync with upstream: git fetch upstream && git rebase upstream/main
+2. Analyze the issue and understand what needs to be fixed
+3. Find the relevant code in the repository
+4. Make the necessary changes to fix the issue
+5. Run tests to verify the fix works
+6. Create a git branch named 'fix/issue-${issue.github_issue_number}'
+7. Commit your changes with a descriptive message
+8. Push the branch to origin (your fork): git push -u origin fix/issue-${issue.github_issue_number}
+9. Create a pull request FROM your fork TO the original repository using:
+   gh pr create --repo ${issue.original_repo_full_name} --head ${forkOwner}:fix/issue-${issue.github_issue_number} --title "Fix #${issue.github_issue_number}: <brief description>" --body "<description of the fix>"`;
   }
 
   console.log(`[Workspace ${workspaceId}] Starting OpenCode execution...`);
@@ -135,11 +151,26 @@ Instructions:
   });
 
   // Execute OpenCode in the container using Docker SDK
+  // First, write the prompt to a file in the container to avoid shell escaping issues
   let exitCode = 1;
   try {
+    // Write the prompt to a temp file using cat with heredoc (handles all special chars)
+    await execInContainer({
+      containerId,
+      cmd: ["bash", "-c", `cat > /tmp/prompt.txt << 'PROMPT_EOF'\n${prompt}\nPROMPT_EOF`],
+      stdout: stdoutStream,
+      stderr: stderrStream,
+    });
+
+    // Run opencode with the prompt as a file attachment
+    // Message must come before flags, or use -- to separate
+    // Pipe output to tee so it also appears in Docker Desktop logs
     const result = await execInContainer({
       containerId,
-      cmd: ["/home/ubuntu/.opencode/bin/opencode", "run", prompt],
+      cmd: [
+        "bash", "-c",
+        `/home/ubuntu/.opencode/bin/opencode run "Fix the issue described in the attached file" -f /tmp/prompt.txt 2>&1 | tee -a /tmp/opencode.log`,
+      ],
       stdout: stdoutStream,
       stderr: stderrStream,
     });
@@ -190,14 +221,15 @@ Instructions:
     );
     console.log(`[Workspace ${workspaceId}] Marked as completed`);
 
-    // Create or update contribution record if PR was created
+    // Create or update contribution record on completion
     const completedWorkspace = db.get<Workspace>(
       `SELECT * FROM workspaces WHERE id = ?`,
       workspaceId
     );
 
-    if (completedWorkspace?.pr_url && completedWorkspace.issue_id && completedWorkspace.agent_run_id) {
-      const prNumberMatch = completedWorkspace.pr_url.match(/\/pull\/(\d+)/);
+    if (completedWorkspace?.issue_id && completedWorkspace.agent_run_id) {
+      const prUrl = completedWorkspace.pr_url;
+      const prNumberMatch = prUrl?.match(/\/pull\/(\d+)/);
       const prNumber = prNumberMatch?.[1] ? parseInt(prNumberMatch[1]) : null;
 
       // Check if contribution already exists for this issue
@@ -207,32 +239,43 @@ Instructions:
       );
 
       if (existingContribution) {
-        // Update existing contribution with PR info
-        db.run(
-          `UPDATE contributions SET pr_url = ?, pr_number = ?, branch_name = ?, status = ?, updated_at = datetime('now') WHERE id = ?`,
-          completedWorkspace.pr_url,
-          prNumber,
-          completedWorkspace.branch_name,
-          "pr_open",
-          existingContribution.id
-        );
-        console.log(`[Workspace ${workspaceId}] Updated contribution ${existingContribution.id} with PR ${completedWorkspace.pr_url}`);
+        // Update existing contribution with PR info (if available)
+        if (prUrl) {
+          db.run(
+            `UPDATE contributions SET pr_url = ?, pr_number = ?, branch_name = ?, status = ?, updated_at = datetime('now') WHERE id = ?`,
+            prUrl,
+            prNumber,
+            completedWorkspace.branch_name,
+            "pr_open",
+            existingContribution.id
+          );
+          console.log(`[Workspace ${workspaceId}] Updated contribution ${existingContribution.id} with PR ${prUrl}`);
+        } else {
+          // Update branch name and status even without PR URL
+          db.run(
+            `UPDATE contributions SET branch_name = ?, status = ?, updated_at = datetime('now') WHERE id = ?`,
+            completedWorkspace.branch_name,
+            "pr_open",
+            existingContribution.id
+          );
+          console.log(`[Workspace ${workspaceId}] Updated contribution ${existingContribution.id} (no PR URL detected)`);
+        }
       } else {
-        // Create new contribution
+        // Create new contribution (even without PR URL - branch was pushed)
         db.run(
           `INSERT INTO contributions (agent_run_id, issue_id, pr_url, pr_number, branch_name, status) 
            VALUES (?, ?, ?, ?, ?, ?)`,
           completedWorkspace.agent_run_id,
           completedWorkspace.issue_id,
-          completedWorkspace.pr_url,
+          prUrl || null,
           prNumber,
           completedWorkspace.branch_name,
           "pr_open"
         );
-        console.log(`[Workspace ${workspaceId}] Created contribution with PR ${completedWorkspace.pr_url}`);
+        console.log(`[Workspace ${workspaceId}] Created contribution${prUrl ? ` with PR ${prUrl}` : ' (no PR URL detected)'}`);
       }
 
-      // Update issue status to 'pr_open'
+      // Always update issue status to 'pr_open' on successful completion
       db.run(
         `UPDATE issues SET status = 'pr_open' WHERE id = ?`,
         completedWorkspace.issue_id
@@ -513,8 +556,10 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
         full_name: string;
         url: string;
         language: string | null;
+        fork_full_name: string | null;
+        fork_url: string | null;
       }>(
-        `SELECT id, full_name, url, language FROM repositories WHERE id = ?`,
+        `SELECT id, full_name, url, language, fork_full_name, fork_url FROM repositories WHERE id = ?`,
         issue.repository_id
       );
 
@@ -536,7 +581,33 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
         repo.id
       );
 
-      // 3.5. Check for existing contribution with branch (for re-runs)
+      // 3.5. Check for existing open PR for this issue using gh CLI
+      let existingOpenPrUrl: string | null = null;
+      try {
+        const ghCheckResult = await Bun.spawn([
+          "gh", "pr", "list",
+          "--repo", repo.full_name,
+          "--search", `fix issue #${issue.github_issue_number} in:title`,
+          "--state", "open",
+          "--json", "number,url",
+          "--limit", "1"
+        ], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        
+        const output = await new Response(ghCheckResult.stdout).text();
+        const prs = JSON.parse(output || "[]");
+        if (prs.length > 0) {
+          existingOpenPrUrl = prs[0].url;
+          console.log(`[Spawn] Found existing open PR for issue #${issue.github_issue_number}: ${existingOpenPrUrl}`);
+        }
+      } catch (err) {
+        // Ignore errors checking for existing PRs - we'll proceed anyway
+        console.log(`[Spawn] Could not check for existing PRs: ${err}`);
+      }
+
+      // 3.6. Check for existing contribution with branch (for re-runs)
       const existingContribution = db.get<{
         branch_name: string | null;
         pr_url: string | null;
@@ -545,10 +616,67 @@ export const workspacesRoutes = new Elysia({ prefix: "/workspaces" })
         issue.id
       );
       const existingBranchName = existingContribution?.branch_name || null;
-      const existingPrUrl = existingContribution?.pr_url || null;
+      const existingPrUrl = existingContribution?.pr_url || existingOpenPrUrl || null;
       
       if (existingBranchName) {
         console.log(`[Spawn] Re-run detected - reusing existing branch: ${existingBranchName}`);
+      }
+
+      // 3.7. Create or get fork of the repository
+      let forkFullName = repo.fork_full_name;
+      let forkUrl = repo.fork_url;
+      
+      if (!forkFullName || !forkUrl) {
+        console.log(`[Spawn] Creating fork of ${repo.full_name}...`);
+        try {
+          // Fork the repository using gh CLI
+          const forkResult = await Bun.spawn([
+            "gh", "repo", "fork", repo.full_name, "--clone=false"
+          ], {
+            stdout: "pipe",
+            stderr: "pipe",
+          });
+          
+          await forkResult.exited;
+          const forkStderr = await new Response(forkResult.stderr).text();
+          
+          // gh repo fork outputs to stderr, check for success patterns
+          // It says "Created fork owner/repo" or "owner/repo already exists"
+          console.log(`[Spawn] Fork command output: ${forkStderr}`);
+          
+          // Get the current GitHub user to construct fork URL
+          const userResult = await Bun.spawn([
+            "gh", "api", "user", "--jq", ".login"
+          ], {
+            stdout: "pipe",
+            stderr: "pipe",
+          });
+          
+          const githubUser = (await new Response(userResult.stdout).text()).trim();
+          if (!githubUser) {
+            throw new Error("Could not determine GitHub username");
+          }
+          
+          const repoName = repo.full_name.split("/")[1];
+          forkFullName = `${githubUser}/${repoName}`;
+          forkUrl = `https://github.com/${forkFullName}`;
+          
+          // Save fork info to database
+          db.run(
+            `UPDATE repositories SET fork_full_name = ?, fork_url = ? WHERE id = ?`,
+            forkFullName,
+            forkUrl,
+            repo.id
+          );
+          
+          console.log(`[Spawn] Fork created/found: ${forkFullName} (${forkUrl})`);
+        } catch (err) {
+          const errorMsg = err instanceof Error ? err.message : "Unknown error";
+          console.error(`[Spawn] Fork creation failed: ${errorMsg}`);
+          throw new Error(`Failed to create fork: ${errorMsg}`);
+        }
+      } else {
+        console.log(`[Spawn] Using existing fork: ${forkFullName}`);
       }
 
       // 4. Create initial workspace record
@@ -632,13 +760,22 @@ Requirements:
 
 2. Set DEBIAN_FRONTEND=noninteractive
 
-3. Install core utilities:
-   - curl, wget, git, vim, sudo, ca-certificates, gnupg, unzip
+3. Install core utilities (in a separate RUN layer, clean apt lists after):
+   RUN apt-get update && apt-get install -y \\
+       curl wget git vim sudo ca-certificates gnupg unzip \\
+       && rm -rf /var/lib/apt/lists/*
 
-4. Install GitHub CLI (gh):
-   RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg \\
-       && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \\
-       && apt-get update && apt-get install -y gh
+4. Install GitHub CLI (gh) by downloading the latest release binary:
+   RUN ARCH=$(dpkg --print-architecture) && \\
+       GH_VERSION=$(curl -sL https://api.github.com/repos/cli/cli/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/^v//') && \\
+       if [ "$ARCH" = "amd64" ]; then GH_ARCH="linux_amd64"; \\
+       elif [ "$ARCH" = "arm64" ]; then GH_ARCH="linux_arm64"; \\
+       else GH_ARCH="linux_amd64"; fi && \\
+       curl -fsSL "https://github.com/cli/cli/releases/download/v\${GH_VERSION}/gh_\${GH_VERSION}_\${GH_ARCH}.tar.gz" -o /tmp/gh.tar.gz && \\
+       tar -xzf /tmp/gh.tar.gz -C /tmp && \\
+       mv /tmp/gh_*/bin/gh /usr/local/bin/gh && \\
+       chmod +x /usr/local/bin/gh && \\
+       rm -rf /tmp/gh.tar.gz /tmp/gh_*
 
 5. Create a non-root user 'ubuntu' with passwordless sudo:
    RUN useradd -m -s /bin/bash ubuntu \\
@@ -656,16 +793,19 @@ Requirements:
 8. Install OpenCode AI:
    RUN curl -fsSL https://opencode.ai/install | bash
 
-9. Clone the repository:
-   RUN git clone ${repo.url}.git /home/ubuntu/repo
+9. Clone YOUR FORK of the repository (not the original):
+   RUN git clone ${forkUrl}.git /home/ubuntu/repo
 
 10. Set working directory to repo:
     WORKDIR /home/ubuntu/repo
 
-11. Set PATH to include OpenCode:
+11. Add upstream remote pointing to the original repository:
+    RUN git remote add upstream ${repo.url}.git
+
+12. Set PATH to include OpenCode:
     ENV PATH="/home/ubuntu/.opencode/bin:$PATH"
 
-12. Default command:
+13. Default command:
     CMD ["bash"]
 
 IMPORTANT: Do NOT install project dependencies (no npm install, pip install, etc). Dependencies will be installed at runtime.
@@ -766,7 +906,7 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
         containerId = await createAndStartContainer({
           image: imageName,
           name: containerName,
-          cmd: ["tail", "-f", "/dev/null"],  // Keep container running
+          cmd: ["bash", "-c", "touch /tmp/opencode.log && tail -f /tmp/opencode.log"],  // Keep container running and show logs
           env: {
             GH_TOKEN: process.env.GH_TOKEN || "",
           },
@@ -802,6 +942,8 @@ Output ONLY the complete Dockerfile content, no explanations or markdown code bl
           ai_fix_prompt: issue.ai_fix_prompt,
           existing_branch_name: existingBranchName,
           existing_pr_url: existingPrUrl,
+          original_repo_full_name: repo.full_name,
+          fork_full_name: forkFullName!,
         });
 
         console.log(`[Workspace ${workspace.id}] OpenCode execution started in background`);

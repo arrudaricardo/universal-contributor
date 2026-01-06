@@ -39,7 +39,9 @@ export class Database {
         source TEXT NOT NULL,
         trending_rank INTEGER,
         discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
-        last_checked_at TEXT
+        last_checked_at TEXT,
+        fork_full_name TEXT,
+        fork_url TEXT
       )
     `);
 
@@ -204,6 +206,19 @@ export class Database {
 
     try {
       this.db.run(`ALTER TABLE workspaces ADD COLUMN pr_url TEXT`);
+    } catch {
+      // Column already exists, ignore
+    }
+
+    // Migration: Add fork columns to repositories
+    try {
+      this.db.run(`ALTER TABLE repositories ADD COLUMN fork_full_name TEXT`);
+    } catch {
+      // Column already exists, ignore
+    }
+
+    try {
+      this.db.run(`ALTER TABLE repositories ADD COLUMN fork_url TEXT`);
     } catch {
       // Column already exists, ignore
     }

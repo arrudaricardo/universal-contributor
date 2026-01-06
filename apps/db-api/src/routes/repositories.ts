@@ -13,6 +13,8 @@ export interface Repository {
   trending_rank: number | null;
   discovered_at: string;
   last_checked_at: string | null;
+  fork_full_name: string | null;
+  fork_url: string | null;
 }
 
 export const repositoriesRoutes = new Elysia({ prefix: "/repositories" })
